@@ -312,6 +312,29 @@ describe("server/agents/service coverage", () => {
         expect(reception).not.toHaveProperty("models");
       });
 
+      it("patches an entry field by field, keeping the runtime and keys it does not edit", async () => {
+        const { fsMock, service } = buildModelsService({
+          "anthropic/claude-sonnet-5-5": {
+            agentRuntime: { id: "openclaw" },
+            alias: "sonnet",
+            streaming: false,
+            params: { temperature: 0.2 },
+          },
+        });
+        await service.updateAgent("reception", {
+          models: { "anthropic/claude-sonnet-5-5": { codeMode: false, params: null } },
+        });
+        const entry = fsMock
+          .readConfig()
+          .agents.list.find((a) => a.id === "reception").models["anthropic/claude-sonnet-5-5"];
+        expect(entry).toEqual({
+          agentRuntime: { id: "openclaw" },
+          alias: "sonnet",
+          streaming: false,
+          codeMode: false,
+        });
+      });
+
       it("rejects unknown runtimes, keys and entry shapes without writing", async () => {
         const { fsMock, service } = buildModelsService();
         const before = JSON.stringify(fsMock.readConfig());

@@ -683,7 +683,12 @@ describe("agents.update tier", () => {
     expect(tierResolver(body("openclaw"))).toBe("write");
     expect(tierResolver(body("claude-cli"))).toBe("dangerous");
     expect(tierResolver(body("auto"))).toBe("dangerous");
-    expect(tierResolver({ body: { models: { "a/b": null } } })).toBe("write");
+    // Any removal may fall back to a non-openclaw agents.defaults runtime.
+    expect(tierResolver({ body: { models: { "a/b": null } } })).toBe("dangerous");
+    expect(tierResolver({ body: { models: null } })).toBe("dangerous");
+    expect(tierResolver({ body: { models: { "a/b": { agentRuntime: null } } } })).toBe("dangerous");
+    // Field patches without agentRuntime keep the existing runtime.
+    expect(tierResolver({ body: { models: { "a/b": { codeMode: false } } } })).toBe("write");
     expect(tierResolver({ body: { name: "X" } })).toBe("write");
   });
 });

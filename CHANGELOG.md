@@ -10,9 +10,11 @@ Versions follow this repository's `package.json` release counter.
 ### Added
 
 - **Per-agent model runtime through AlphaClaw:** `PUT /api/agents/:id` (`agents.update`) accepts an optional `models` map keyed by `provider/model`. Each entry may carry `agentRuntime.id` (`openclaw`, `claude-cli`, `codex`, `copilot` or `auto`), `params` and `codeMode`. This lets one agent run a model on a different runtime without changing `agents.defaults`.
-  - Updates merge by model id: `null` removes an entry, and `models: null` clears the whole map.
+  - Updates patch each entry field by field: a supplied field replaces that field, and a field set to `null` is removed. Omitted fields are kept, including `alias`, `streaming` and `pickerRuntimes`.
+  - An entry set to `null` removes that model's settings, and `models: null` clears the whole map.
   - Unknown runtime ids and unknown keys are refused. OpenClaw 2026.9.5 accepts any runtime id, so AlphaClaw checks it.
-  - Moving a model to a runtime other than `openclaw` is a dangerous-tier admin op.
+  - `codeMode` is refused on wildcard model refs, which OpenClaw rejects.
+  - Moving a model to a runtime other than `openclaw` is a dangerous-tier admin op. So is removing an entry or its runtime, because that can fall back to a non-`openclaw` default.
 
 ## [0.9.98] - 2026-09-30
 
