@@ -1143,6 +1143,59 @@ describe("server/agents/service coverage", () => {
       expect(promoted.agents.list[1].default).toBeFalsy();
     });
 
+    it("keeps an explicit-ownership roster free of default markers (#126)", () => {
+      const normalized = withNormalizedAgentsConfig({
+        OPENCLAW_DIR,
+        cfg: {
+          agents: {
+            ownership: "explicit",
+            defaults: { systemAgent: { agentId: "ops" } },
+            list: [
+              { id: "ops" },
+              { id: "stray", default: true },
+              { id: "side", default: false },
+            ],
+          },
+        },
+      });
+
+      expect(normalized.agents.ownership).toBe("explicit");
+      expect(normalized.agents.defaults).toEqual({
+        systemAgent: { agentId: "ops" },
+      });
+      expect(normalized.agents.list).toEqual([
+        { id: "ops" },
+        { id: "stray" },
+        { id: "side", default: false },
+      ]);
+    });
+
+    it("saves an explicit-ownership entries roster without stamping default (#126)", async () => {
+      const { fsMock, service } = buildService({
+        initialConfig: {
+          agents: {
+            ownership: "explicit",
+            defaults: { systemAgent: { agentId: "main" } },
+            entries: {
+              main: { workspace: "/tmp/openclaw/workspace" },
+              second: { workspace: "/tmp/openclaw/workspace-second" },
+            },
+          },
+        },
+      });
+
+      await service.updateAgent("second", { name: "Second" });
+
+      const saved = fsMock.readConfig().agents;
+      expect(saved.ownership).toBe("explicit");
+      expect(saved).not.toHaveProperty("list");
+      expect(Object.keys(saved.entries)).toEqual(["main", "second"]);
+      for (const entry of Object.values(saved.entries)) {
+        expect(entry).not.toHaveProperty("default");
+      }
+      expect(fsMock.writeFileSync).toHaveBeenCalled();
+    });
+
     it("rejects invalid workspace folder names", () => {
       expect(() =>
         resolveRequestedWorkspacePath({
