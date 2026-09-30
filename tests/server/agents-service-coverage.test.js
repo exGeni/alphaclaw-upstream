@@ -1231,6 +1231,34 @@ describe("server/agents/service coverage", () => {
       );
     });
 
+    it("refuses to delete an explicit fleet's ownership targets (#126)", () => {
+      const { fsMock, service } = buildService({
+        initialConfig: {
+          agents: {
+            ownership: "explicit",
+            defaults: {
+              systemAgent: { agentId: "main" },
+              authInheritance: { agentId: "creds" },
+            },
+            entries: {
+              main: { workspace: "/tmp/openclaw/workspace" },
+              creds: { workspace: "/tmp/openclaw/workspace-creds" },
+              spare: { workspace: "/tmp/openclaw/workspace-spare" },
+            },
+          },
+        },
+      });
+
+      expect(() => service.deleteAgent("creds")).toThrow(
+        'Agent "creds" owns agents.defaults.authInheritance.agentId and cannot be deleted',
+      );
+      expect(service.deleteAgent("spare")).toEqual({ ok: true });
+      expect(Object.keys(fsMock.readConfig().agents.entries)).toEqual([
+        "main",
+        "creds",
+      ]);
+    });
+
     it("rejects invalid workspace folder names", () => {
       expect(() =>
         resolveRequestedWorkspacePath({
