@@ -535,6 +535,22 @@ describe("server/commands clawCmd timeout kills the whole process group", () => 
     });
   });
 
+  it("stops retaining output past the cap while a TERM-resistant CLI keeps writing", async () => {
+    writeFakeOpenclaw(`trap '' TERM\nwhile :; do head -c 65536 /dev/zero | tr '\\0' x; done`);
+    const clawCmd = loadClawCmd();
+
+    const result = await clawCmd("x", {
+      quiet: true,
+      timeoutMs: 10000,
+      maxBuffer: 100000,
+      killGraceMs: 500,
+    });
+
+    expect(result).toMatchObject({ ok: false, code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" });
+    // At most one pipe chunk past the cap is kept.
+    expect(result.stdout.length).toBeLessThanOrEqual(100000 + 65536);
+  });
+
   it("returns a fast command's output unchanged, with no code on success", async () => {
     writeFakeOpenclaw(`echo "out:$*"\necho err >&2`);
     const clawCmd = loadClawCmd();
