@@ -5,6 +5,14 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.9.100] - 2026-09-30
+
+### Added
+
+- **Per-agent skill allowlist through AlphaClaw:** `PUT /api/agents/:id` (`agents.update`) accepts `skills`, which sets OpenClaw's `agents.entries.<id>.skills`.
+  - A list becomes the agent's exact skill set and replaces the defaults; `[]` exposes no skills; `null` inherits `agents.defaults.skills`.
+  - Narrowing is a write-tier admin op. Widening beyond the agent's current effective set, or removing the list, is dangerous-tier.
+
 ## [0.9.99] - 2026-09-30
 
 ### Added
