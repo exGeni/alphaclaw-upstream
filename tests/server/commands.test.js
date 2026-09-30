@@ -569,6 +569,16 @@ describe("server/commands clawCmd timeout kills the whole process group", () => 
     expect(result.stdout.length).toBeLessThanOrEqual(100000 + 65536);
   });
 
+  it("counts the output cap in bytes, not characters", async () => {
+    // 400 three-byte characters = 1200 bytes > a 1000-byte cap (400 chars < it).
+    writeFakeOpenclaw(`printf '中%.0s' $(seq 1 400)\nsleep 30`);
+    const clawCmd = loadClawCmd();
+
+    const result = await clawCmd("x", { quiet: true, timeoutMs: 10000, maxBuffer: 1000 });
+
+    expect(result).toMatchObject({ ok: false, code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" });
+  });
+
   it("returns a fast command's output unchanged, with no code on success", async () => {
     writeFakeOpenclaw(`echo "out:$*"\necho err >&2`);
     const clawCmd = loadClawCmd();
