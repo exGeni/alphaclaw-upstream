@@ -504,9 +504,11 @@ describe("server/commands clawCmd timeout kills the whole process group", () => 
     expect(Date.now() - startedAt).toBeLessThan(5000);
   });
 
-  it("killScope leader keeps the CLI running past the call (WhatsApp QR login)", async () => {
+  it("killScope leader keeps the CLI running and writing past the call (WhatsApp QR login)", async () => {
+    // The shell wrapper is the leader; the CLI keeps printing after the call
+    // returns (a closed pipe would SIGPIPE it) and only then finishes.
     writeFakeOpenclaw(
-      `echo QR-BLOCK\nsleep 1\necho linked > "${dir}/marker"\necho $$ > "${dir}/pids"`,
+      `echo QR-BLOCK\nsleep 1\necho more-output\necho linked > "${dir}/marker"\necho $$ > "${dir}/pids"`,
     );
     const clawCmd = loadClawCmd();
 
@@ -519,6 +521,22 @@ describe("server/commands clawCmd timeout kills the whole process group", () => 
 
     expect(result).toMatchObject({ ok: false, timedOut: true, stdout: "QR-BLOCK" });
     expect(await waitFor(() => fs.existsSync(path.join(dir, "marker")), 5000)).toBe(true);
+  });
+
+  it("killScope leader settles when the leader already exited but a descendant holds the pipes", async () => {
+    writeFakeOpenclaw(`(sleep 30; true) &\necho "$!" > "${dir}/pids"\nexit 0`);
+    delete require.cache[modulePath];
+    const { createCommands } = require(modulePath);
+    const clawCmd = createCommands({
+      gatewayEnv: () => ({ ...process.env, PATH: `${dir}:${process.env.PATH}` }),
+    }).clawCmd;
+    // `exec` makes the fake CLI the shell itself, so the backgrounded
+    // subshell is the only pipe holder once the leader exits.
+    const startedAt = Date.now();
+    const result = await clawCmd("x", { quiet: true, timeoutMs: 400, killScope: "leader" });
+
+    expect(result).toMatchObject({ ok: false, timedOut: true });
+    expect(Date.now() - startedAt).toBeLessThan(5000);
   });
 
   it("fails an output overflow like exec's maxBuffer (reads as a timeout)", async () => {
