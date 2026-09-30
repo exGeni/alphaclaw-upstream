@@ -4,18 +4,42 @@ const {
   OPENCLAW_DIR,
   GOG_KEYRING_PASSWORD,
 } = require("../../lib/server/constants");
+const { EventEmitter } = require("events");
 const modulePath = require.resolve("../../lib/server/commands");
 const originalExec = childProcess.exec;
+const originalSpawn = childProcess.spawn;
 
-const loadCommandsModule = ({ execMock }) => {
-  childProcess.exec = execMock;
+const loadCommandsModule = ({ execMock, spawnMock } = {}) => {
+  if (execMock) childProcess.exec = execMock;
+  if (spawnMock) childProcess.spawn = spawnMock;
   delete require.cache[modulePath];
   return require(modulePath);
+};
+
+// A fake clawCmd child: no pid (so the group kill falls back to child.kill),
+// emits the scripted output and close on the next tick; `hang` never closes
+// until killed.
+const makeFakeChild = ({ code = 0, signal = null, stdout = "", stderr = "", hang = false } = {}) => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = vi.fn((sig) => {
+    setImmediate(() => child.emit("close", null, sig));
+  });
+  if (!hang) {
+    setImmediate(() => {
+      if (stdout) child.stdout.emit("data", Buffer.from(stdout));
+      if (stderr) child.stderr.emit("data", Buffer.from(stderr));
+      child.emit("close", code, signal);
+    });
+  }
+  return child;
 };
 
 describe("server/commands", () => {
   afterEach(() => {
     childProcess.exec = originalExec;
+    childProcess.spawn = originalSpawn;
     delete require.cache[modulePath];
   });
 
@@ -37,31 +61,26 @@ describe("server/commands", () => {
   });
 
   it("preserves timeout metadata on clawCmd failures", async () => {
-    const timeoutError = Object.assign(new Error("Command failed"), {
-      code: null,
-      killed: true,
-      signal: "SIGTERM",
-    });
-    const execMock = vi.fn((cmd, opts, callback) => {
-      callback(timeoutError, "", "");
-    });
-    const { createCommands } = loadCommandsModule({ execMock });
+    const spawnMock = vi.fn(() => makeFakeChild({ hang: true }));
+    const { createCommands } = loadCommandsModule({ spawnMock });
     const { clawCmd } = createCommands({
       gatewayEnv: () => ({ OPENCLAW_GATEWAY_TOKEN: "token" }),
     });
 
     const result = await clawCmd("nodes status --json", {
       quiet: true,
-      timeoutMs: 1234,
+      timeoutMs: 20,
     });
 
-    expect(execMock).toHaveBeenCalledWith(
-      "openclaw nodes status --json",
+    // Own process group via spawn (exec ignores `detached`); the command text
+    // still runs through /bin/sh unchanged.
+    expect(spawnMock).toHaveBeenCalledWith(
+      "/bin/sh",
+      ["-c", "openclaw nodes status --json"],
       expect.objectContaining({
-        timeout: 1234,
-        killSignal: "SIGTERM",
+        detached: true,
+        env: { OPENCLAW_GATEWAY_TOKEN: "token" },
       }),
-      expect.any(Function),
     );
     expect(result).toMatchObject({
       ok: false,
@@ -96,10 +115,8 @@ describe("server/commands", () => {
 
   it("logs clawCmd failures when not quiet", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const execMock = vi.fn((cmd, opts, callback) => {
-      callback(Object.assign(new Error("fail"), { code: 2 }), "", "bad flag\n");
-    });
-    const { createCommands } = loadCommandsModule({ execMock });
+    const spawnMock = vi.fn(() => makeFakeChild({ code: 2, stderr: "bad flag\n" }));
+    const { createCommands } = loadCommandsModule({ spawnMock });
     const { clawCmd } = createCommands({
       gatewayEnv: () => ({ OPENCLAW_GATEWAY_TOKEN: "token" }),
     });
@@ -121,14 +138,13 @@ describe("server/commands", () => {
 
   it("scrubs token-bearing URL params from the failed-command stderr log", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const execMock = vi.fn((cmd, opts, callback) => {
-      callback(
-        Object.assign(new Error("fail"), { code: 1 }),
-        "",
-        "could not open http://127.0.0.1:18789/#token=leaky-shared-token — also ?bootstrapToken=leaky-handoff expired\n",
-      );
-    });
-    const { createCommands } = loadCommandsModule({ execMock });
+    const spawnMock = vi.fn(() =>
+      makeFakeChild({
+        code: 1,
+        stderr: "could not open http://127.0.0.1:18789/#token=leaky-shared-token — also ?bootstrapToken=leaky-handoff expired\n",
+      }),
+    );
+    const { createCommands } = loadCommandsModule({ spawnMock });
     const { clawCmd } = createCommands({ gatewayEnv: () => ({}) });
 
     const result = await clawCmd("dashboard --no-open");
@@ -220,25 +236,25 @@ describe("server/commands", () => {
   });
 
   describe("clawCmdWithRetry (gateway rate limiting)", () => {
-    const makeExec = (queue) =>
-      vi.fn((cmd, opts, callback) => {
+    const makeSpawn = (queue) =>
+      vi.fn(() => {
         const next = queue.shift();
-        if (next.err) {
-          callback(Object.assign(new Error("failed"), { code: next.code }), next.stdout || "", next.stderr || "");
-        } else {
-          callback(null, next.stdout || "", next.stderr || "");
-        }
+        return makeFakeChild({
+          code: next.err ? (next.code ?? 1) : 0,
+          stdout: next.stdout || "",
+          stderr: next.stderr || "",
+        });
       });
 
     it("retries on an UNAVAILABLE response honoring retryAfterMs, then succeeds", async () => {
-      const execMock = makeExec([
+      const spawnMock = makeSpawn([
         {
           err: true,
           stderr: '{"code":"UNAVAILABLE","retryable":true,"retryAfterMs":1200}',
         },
         { err: false, stdout: '{"ok":true}' },
       ]);
-      const { createCommands } = loadCommandsModule({ execMock });
+      const { createCommands } = loadCommandsModule({ spawnMock });
       const { clawCmdWithRetry } = createCommands({ gatewayEnv: () => ({}) });
       const sleeps = [];
       const result = await clawCmdWithRetry("gateway call config.patch", {
@@ -246,15 +262,15 @@ describe("server/commands", () => {
       });
       expect(result.ok).toBe(true);
       expect(sleeps).toEqual([1200]);
-      expect(execMock).toHaveBeenCalledTimes(2);
+      expect(spawnMock).toHaveBeenCalledTimes(2);
     });
 
     it("caps the backoff at maxBackoffMs", async () => {
-      const execMock = makeExec([
+      const spawnMock = makeSpawn([
         { err: true, stderr: '{"code":"UNAVAILABLE","retryAfterMs":999999}' },
         { err: false, stdout: "ok" },
       ]);
-      const { createCommands } = loadCommandsModule({ execMock });
+      const { createCommands } = loadCommandsModule({ spawnMock });
       const { clawCmdWithRetry } = createCommands({ gatewayEnv: () => ({}) });
       const sleeps = [];
       await clawCmdWithRetry("gateway call config.patch", {
@@ -264,31 +280,31 @@ describe("server/commands", () => {
     });
 
     it("gives up after maxRetries and returns the last failure", async () => {
-      const execMock = makeExec([
+      const spawnMock = makeSpawn([
         { err: true, stderr: '{"code":"UNAVAILABLE","retryAfterMs":10}' },
         { err: true, stderr: '{"code":"UNAVAILABLE","retryAfterMs":10}' },
         { err: true, stderr: '{"code":"UNAVAILABLE","retryAfterMs":10}' },
       ]);
-      const { createCommands } = loadCommandsModule({ execMock });
+      const { createCommands } = loadCommandsModule({ spawnMock });
       const { clawCmdWithRetry } = createCommands({ gatewayEnv: () => ({}) });
       const result = await clawCmdWithRetry("gateway call config.patch", {
         sleepFn: async () => {},
       });
       expect(result.ok).toBe(false);
-      expect(execMock).toHaveBeenCalledTimes(3); // initial + 2 retries
+      expect(spawnMock).toHaveBeenCalledTimes(3); // initial + 2 retries
     });
 
     it("does not retry a non-rate-limit failure", async () => {
-      const execMock = makeExec([
+      const spawnMock = makeSpawn([
         { err: true, stderr: "some other error" },
       ]);
-      const { createCommands } = loadCommandsModule({ execMock });
+      const { createCommands } = loadCommandsModule({ spawnMock });
       const { clawCmdWithRetry } = createCommands({ gatewayEnv: () => ({}) });
       const result = await clawCmdWithRetry("gateway call config.patch", {
         sleepFn: async () => {},
       });
       expect(result.ok).toBe(false);
-      expect(execMock).toHaveBeenCalledTimes(1);
+      expect(spawnMock).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -350,6 +366,101 @@ describe("server/commands", () => {
 // never whatever `openclaw` resolves to on PATH. clawCmdWithBin is clawCmd's
 // argv-form twin for that: `process.execPath [bin, ...args]`, caller env, same
 // result object.
+// Real processes, no exec mock: a fake `openclaw` on PATH that backgrounds a
+// grandchild and waits, exactly the shape dash gives `exec("openclaw …")`.
+describe("server/commands clawCmd timeout kills the whole process group", () => {
+  const fs = require("fs");
+  const os = require("os");
+  const path = require("path");
+  let dir;
+  const isAlive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const writeFakeOpenclaw = (body) => {
+    const bin = path.join(dir, "openclaw");
+    fs.writeFileSync(bin, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+  };
+  const readPids = () =>
+    fs
+      .readFileSync(path.join(dir, "pids"), "utf8")
+      .trim()
+      .split(/\s+/)
+      .map(Number);
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawcmd-group-"));
+  });
+  afterEach(() => {
+    for (const pid of fs.existsSync(path.join(dir, "pids")) ? readPids() : []) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const gatewayEnv = () => ({ ...process.env, PATH: `${dir}:${process.env.PATH}` });
+
+  it("leaves no openclaw grandchild alive after a timeout", async () => {
+    writeFakeOpenclaw(
+      `sleep 30 &\necho "$$ $!" > "${dir}/pids"\nwait`,
+    );
+    delete require.cache[modulePath];
+    const { createCommands } = require(modulePath);
+    const { clawCmd } = createCommands({ gatewayEnv });
+
+    const result = await clawCmd("channels add --channel telegram", {
+      quiet: true,
+      timeoutMs: 500,
+    });
+
+    expect(result).toMatchObject({ ok: false, killed: true, timedOut: true });
+    const pids = readPids();
+    expect(pids).toHaveLength(2);
+    for (const pid of pids) expect(isAlive(pid)).toBe(false);
+  });
+
+  it("SIGKILLs a group that ignores the timeout signal after the grace period", async () => {
+    writeFakeOpenclaw(
+      `trap '' TERM\nsh -c 'trap "" TERM; sleep 30' &\necho "$$ $!" > "${dir}/pids"\nwait`,
+    );
+    delete require.cache[modulePath];
+    const { createCommands } = require(modulePath);
+    const { clawCmd } = createCommands({ gatewayEnv });
+
+    const startedAt = Date.now();
+    const result = await clawCmd("pairing list --channel telegram --json", {
+      quiet: true,
+      timeoutMs: 300,
+      killGraceMs: 400,
+    });
+
+    expect(result).toMatchObject({ ok: false, timedOut: true });
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(300);
+    for (const pid of readPids()) expect(isAlive(pid)).toBe(false);
+  });
+
+  it("returns a fast command's output unchanged and arms no kill", async () => {
+    writeFakeOpenclaw(`echo "out:$*"\necho err >&2`);
+    delete require.cache[modulePath];
+    const { createCommands } = require(modulePath);
+    const { clawCmd } = createCommands({ gatewayEnv });
+
+    const result = await clawCmd("pairing list --json", { quiet: true, timeoutMs: 5000 });
+
+    expect(result).toMatchObject({
+      ok: true,
+      stdout: "out:pairing list --json",
+      stderr: "err",
+    });
+  });
+});
+
 describe("server/commands clawCmdWithBin (#76 C6)", () => {
   const fs = require("fs");
   const os = require("os");
