@@ -5,6 +5,15 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.9.99] - 2026-09-30
+
+### Added
+
+- **Per-agent model runtime through AlphaClaw:** `PUT /api/agents/:id` (`agents.update`) accepts an optional `models` map keyed by `provider/model`. Each entry may carry `agentRuntime.id` (`openclaw`, `claude-cli`, `codex`, `copilot` or `auto`), `params` and `codeMode`. This lets one agent run a model on a different runtime without changing `agents.defaults`.
+  - Updates merge by model id: `null` removes an entry, and `models: null` clears the whole map.
+  - Unknown runtime ids and unknown keys are refused. OpenClaw 2026.9.5 accepts any runtime id, so AlphaClaw checks it.
+  - Moving a model to a runtime other than `openclaw` is a dangerous-tier admin op.
+
 ## [0.9.98] - 2026-09-30
 
 ### Added
