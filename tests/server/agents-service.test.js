@@ -2185,6 +2185,139 @@ describe("server/agents/service", () => {
     expect(fsMock.rmSync).not.toHaveBeenCalled();
   });
 
+  describe("channel account DM access (dmPolicy / allowFrom)", () => {
+    const buildDmService = (telegramRoot = {}) => {
+      const fsMock = buildFsMock({
+        initialConfig: {
+          agents: { list: [{ id: "main", default: true }, { id: "reception" }] },
+          channels: {
+            telegram: {
+              enabled: true,
+              defaultAccount: "default",
+              ...telegramRoot,
+              accounts: {
+                default: {
+                  botToken: "${TELEGRAM_BOT_TOKEN}",
+                  name: "Owner",
+                  dmPolicy: "allowlist",
+                  allowFrom: ["111111"],
+                },
+                clients: {
+                  botToken: "${TELEGRAM_BOT_TOKEN_CLIENTS}",
+                  name: "Clients",
+                  dmPolicy: "pairing",
+                },
+              },
+            },
+          },
+          bindings: [
+            { agentId: "reception", match: { channel: "telegram", accountId: "clients" } },
+          ],
+        },
+      });
+      const service = createAgentsService({ fs: fsMock, OPENCLAW_DIR: "/tmp/openclaw" });
+      return { fsMock, service };
+    };
+    const update = (service, extra) =>
+      service.updateChannelAccount({
+        provider: "telegram",
+        accountId: "clients",
+        name: "Clients",
+        agentId: "reception",
+        ...extra,
+      });
+
+    it("makes one account public with open + \"*\" and leaves the others untouched", () => {
+      const { fsMock, service } = buildDmService();
+      const before = JSON.parse(JSON.stringify(fsMock.readConfig().channels.telegram.accounts.default));
+
+      const result = update(service, { dmPolicy: "open", allowFrom: ["*"] });
+
+      expect(result.account).toMatchObject({ dmPolicy: "open", allowFrom: ["*"] });
+      const accounts = fsMock.readConfig().channels.telegram.accounts;
+      expect(accounts.clients).toEqual({
+        botToken: "${TELEGRAM_BOT_TOKEN_CLIENTS}",
+        name: "Clients",
+        dmPolicy: "open",
+        allowFrom: ["*"],
+      });
+      expect(accounts.default).toEqual(before);
+    });
+
+    it("rejects open without \"*\" and writes nothing", () => {
+      const { fsMock, service } = buildDmService();
+      const before = JSON.stringify(fsMock.readConfig());
+
+      expect(() => update(service, { dmPolicy: "open" })).toThrow(
+        'dmPolicy "open" requires allowFrom to include "*"',
+      );
+      expect(() => update(service, { dmPolicy: "open", allowFrom: ["123"] })).toThrow(
+        'dmPolicy "open" requires allowFrom to include "*"',
+      );
+      expect(JSON.stringify(fsMock.readConfig())).toBe(before);
+    });
+
+    it("rejects allowlist without a sender id, invalid ids and unknown policies", () => {
+      const { service } = buildDmService();
+      expect(() => update(service, { dmPolicy: "allowlist", allowFrom: [] })).toThrow(
+        "requires at least one sender id",
+      );
+      expect(() => update(service, { dmPolicy: "allowlist", allowFrom: ["@someone"] })).toThrow(
+        "is not a numeric Telegram user id",
+      );
+      expect(() => update(service, { dmPolicy: "public" })).toThrow(
+        "dmPolicy must be one of",
+      );
+      expect(() => update(service, { allowFrom: "123" })).toThrow("allowFrom must be an array");
+    });
+
+    it("refuses open under a restrictive channel-level allowFrom", () => {
+      const { service } = buildDmService({ allowFrom: ["111111"] });
+      expect(() => update(service, { dmPolicy: "open", allowFrom: ["*"] })).toThrow(
+        "channel-level allowFrom is a restrictive allowlist",
+      );
+    });
+
+    it("keeps DM access untouched when neither field is sent, and can revert to pairing", () => {
+      const { fsMock, service } = buildDmService();
+      update(service, { dmPolicy: "open", allowFrom: ["*"] });
+
+      const plain = update(service, {});
+      expect(plain.account).not.toHaveProperty("dmPolicy");
+      expect(fsMock.readConfig().channels.telegram.accounts.clients.dmPolicy).toBe("open");
+
+      update(service, { dmPolicy: "pairing", allowFrom: [] });
+      const clients = fsMock.readConfig().channels.telegram.accounts.clients;
+      expect(clients.dmPolicy).toBe("pairing");
+      expect(clients).not.toHaveProperty("allowFrom");
+    });
+
+    it("refuses DM access fields for providers without account-level support", () => {
+      const fsMock = buildFsMock({
+        initialConfig: {
+          agents: { list: [{ id: "main", default: true }] },
+          channels: {
+            whatsapp: {
+              enabled: true,
+              defaultAccount: "default",
+              accounts: { default: { name: "WhatsApp", dmPolicy: "allowlist", allowFrom: ["+100"] } },
+            },
+          },
+        },
+      });
+      const service = createAgentsService({ fs: fsMock, OPENCLAW_DIR: "/tmp/openclaw" });
+      expect(() =>
+        service.updateChannelAccount({
+          provider: "whatsapp",
+          name: "WhatsApp",
+          agentId: "main",
+          dmPolicy: "open",
+          allowFrom: ["*"],
+        }),
+      ).toThrow("not supported for whatsapp");
+    });
+  });
+
   it("updates channel account name and bound agent", () => {
     const fsMock = buildFsMock({
       initialConfig: {
