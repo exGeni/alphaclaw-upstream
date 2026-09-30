@@ -335,6 +335,13 @@ describe("server/agents/service coverage", () => {
         });
       });
 
+      it("keeps an explicitly supplied empty entry (model registration)", async () => {
+        const { fsMock, service } = buildModelsService();
+        await service.updateAgent("reception", { models: { "vllm/*": {} } });
+        const reception = fsMock.readConfig().agents.list.find((a) => a.id === "reception");
+        expect(reception.models).toEqual({ "vllm/*": {} });
+      });
+
       it("rejects unknown runtimes, keys and entry shapes without writing", async () => {
         const { fsMock, service } = buildModelsService();
         const before = JSON.stringify(fsMock.readConfig());
