@@ -10,8 +10,14 @@ Versions follow this repository's `package.json` release counter.
 ### Added
 
 - **Channel account DM access through AlphaClaw:** `PUT /api/channels/accounts` (admin op `channels.account-update`) accepts optional `dmPolicy` (`pairing`/`allowlist`/`open`/`disabled`) and `allowFrom` for Telegram, Discord and Slack accounts. Operators no longer need `openclaw config set` to make an account public or change its DM allowlist.
-  - The rules follow OpenClaw's access-control docs: `open` requires `"*"`, `allowlist` requires a sender id, and `open` is refused under a restrictive channel-level `allowFrom`.
-  - AlphaClaw enforces these rules itself, because OpenClaw 2026.9.5 does not check them per account.
+  - Only the fields supplied are written; inherited channel-level values stay inherited, and legacy `dm.policy`/`dm.allowFrom` are read and replaced.
+  - The rules follow OpenClaw's access-control docs, checked on the effective values. AlphaClaw enforces them itself, because OpenClaw 2026.9.5 does not check them per account:
+    - `open` requires `"*"`;
+    - `"*"` is allowed only with `open`;
+    - `allowlist` requires a sender id;
+    - Telegram refuses `open` under a channel-level allowlist.
+  - On Telegram, `"*"` pins `groupAllowFrom` to the previous sender list when none is set, so group access does not widen.
+  - Making an account public is a dangerous-tier admin op (confirm code).
   - Nothing is written when validation fails, and no restart is needed.
 
 ## [0.9.97] - 2026-09-30

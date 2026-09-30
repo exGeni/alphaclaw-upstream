@@ -2240,6 +2240,8 @@ describe("server/agents/service", () => {
         name: "Clients",
         dmPolicy: "open",
         allowFrom: ["*"],
+        // Group sender auth would otherwise fall back to allowFrom ["*"].
+        groupAllowFrom: [],
       });
       expect(accounts.default).toEqual(before);
     });
@@ -2398,6 +2400,74 @@ describe("server/agents/service", () => {
         dmPolicy: "open",
         allowFrom: ["*"],
       });
+    });
+
+    it("pins Telegram groupAllowFrom to the previous senders so \"*\" does not open groups", () => {
+      const { fsMock, service } = buildDmService();
+      const cfg = fsMock.readConfig();
+      cfg.channels.telegram.accounts.clients.allowFrom = ["555555"];
+      cfg.channels.telegram.accounts.clients.dmPolicy = "allowlist";
+      fsMock.writeFileSync("/tmp/openclaw/openclaw.json", JSON.stringify(cfg));
+
+      update(service, { dmPolicy: "open", allowFrom: ["*"] });
+
+      expect(fsMock.readConfig().channels.telegram.accounts.clients.groupAllowFrom).toEqual([
+        "555555",
+      ]);
+    });
+
+    it("leaves an existing groupAllowFrom alone", () => {
+      const { fsMock, service } = buildDmService({ groupAllowFrom: ["777777"] });
+      update(service, { dmPolicy: "open", allowFrom: ["*"] });
+      expect(fsMock.readConfig().channels.telegram.accounts.clients).not.toHaveProperty(
+        "groupAllowFrom",
+      );
+    });
+
+    it("accepts only string or number ids and dedupes Telegram prefixes", () => {
+      const { service } = buildDmService();
+      expect(() => update(service, { dmPolicy: "allowlist", allowFrom: [["123"]] })).toThrow(
+        "allowFrom entries must be strings",
+      );
+      expect(() => update(service, { dmPolicy: "allowlist", allowFrom: [true] })).toThrow(
+        "allowFrom entries must be strings",
+      );
+      const result = update(service, {
+        dmPolicy: "allowlist",
+        allowFrom: [" 789 ", "tg:789", 456, "456"],
+      });
+      expect(result.account.allowFrom).toEqual(["789", "456"]);
+    });
+
+    it("does not treat a Discord channel-level allowlist as a boundary", () => {
+      const fsMock = buildFsMock({
+        initialConfig: {
+          agents: { list: [{ id: "main", default: true }] },
+          channels: {
+            discord: {
+              enabled: true,
+              allowFrom: ["111"],
+              accounts: { support: { token: "${DISCORD_BOT_TOKEN_SUPPORT}", name: "Support" } },
+            },
+          },
+        },
+      });
+      const service = createAgentsService({ fs: fsMock, OPENCLAW_DIR: "/tmp/openclaw" });
+      service.updateChannelAccount({
+        provider: "discord",
+        accountId: "support",
+        name: "Support",
+        agentId: "main",
+        dmPolicy: "open",
+        allowFrom: ["*"],
+      });
+      expect(fsMock.readConfig().channels.discord.accounts.support).toMatchObject({
+        dmPolicy: "open",
+        allowFrom: ["*"],
+      });
+      expect(fsMock.readConfig().channels.discord.accounts.support).not.toHaveProperty(
+        "groupAllowFrom",
+      );
     });
 
     it("refuses DM access fields for providers without account-level support", () => {

@@ -660,3 +660,16 @@ describe("admin-manifest stale entries and inline routes (F068, F069, F070, F225
     expect(op).toMatchObject({ id: "updates.capabilities", tier: "safe", domain: "updates" });
   });
 });
+
+describe("channels.account-update tier", () => {
+  it("escalates making an account public to dangerous", () => {
+    const { tierResolver } = require("../../lib/server/admin-manifest/domains/channels.js").ops.find(
+      (op) => op.id === "channels.account-update",
+    );
+    expect(typeof tierResolver).toBe("function");
+    expect(tierResolver({ body: { dmPolicy: "open", allowFrom: ["*"] } })).toBe("dangerous");
+    expect(tierResolver({ body: { allowFrom: [" * "] } })).toBe("dangerous");
+    expect(tierResolver({ body: { dmPolicy: "allowlist", allowFrom: ["123"] } })).toBe("restart");
+    expect(tierResolver({ body: { name: "X", agentId: "main" } })).toBe("restart");
+  });
+});
