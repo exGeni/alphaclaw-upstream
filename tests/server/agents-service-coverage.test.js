@@ -1196,6 +1196,41 @@ describe("server/agents/service coverage", () => {
       expect(fsMock.writeFileSync).toHaveBeenCalled();
     });
 
+    it("records the default as systemAgent on an explicit-ownership fleet (#126)", () => {
+      const { fsMock, service } = buildService({
+        initialConfig: {
+          agents: {
+            ownership: "explicit",
+            defaults: { systemAgent: { agentId: "main" } },
+            entries: {
+              main: { workspace: "/tmp/openclaw/workspace" },
+              second: { workspace: "/tmp/openclaw/workspace-second" },
+            },
+          },
+        },
+      });
+
+      expect(
+        service.listAgents().map((agent) => [agent.id, agent.default]),
+      ).toEqual([
+        ["main", true],
+        ["second", false],
+      ]);
+
+      const updated = service.setDefaultAgent("second");
+      expect(updated.default).toBe(true);
+
+      const saved = fsMock.readConfig().agents;
+      expect(saved.ownership).toBe("explicit");
+      expect(saved.defaults.systemAgent).toEqual({ agentId: "second" });
+      for (const entry of Object.values(saved.entries)) {
+        expect(entry).not.toHaveProperty("default");
+      }
+      expect(() => service.deleteAgent("second")).toThrow(
+        "Default agent cannot be deleted",
+      );
+    });
+
     it("rejects invalid workspace folder names", () => {
       expect(() =>
         resolveRequestedWorkspacePath({
