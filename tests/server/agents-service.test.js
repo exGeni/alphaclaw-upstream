@@ -2439,6 +2439,39 @@ describe("server/agents/service", () => {
       expect(fsMock.readConfig().channels.telegram.accounts.clients.dmPolicy).toBe("open");
     });
 
+    it("uses the account's own empty groupAllowFrom over the root's", () => {
+      const { fsMock, service } = buildDmService({
+        groupAllowFrom: ["777777"],
+        groups: { "-1001": {} },
+      });
+      const cfg = fsMock.readConfig();
+      cfg.channels.telegram.accounts.clients.groupAllowFrom = [];
+      fsMock.writeFileSync("/tmp/openclaw/openclaw.json", JSON.stringify(cfg));
+      expect(() => update(service, { dmPolicy: "open", allowFrom: ["*"] })).toThrow(
+        "would also let every member",
+      );
+    });
+
+    it("inherits root groups when the account's groups map is empty", () => {
+      const { fsMock, service } = buildDmService({ groups: { "-1001": {} } });
+      const cfg = fsMock.readConfig();
+      cfg.channels.telegram.accounts.clients.groups = {};
+      fsMock.writeFileSync("/tmp/openclaw/openclaw.json", JSON.stringify(cfg));
+      expect(() => update(service, { dmPolicy: "open", allowFrom: ["*"] })).toThrow(
+        "would also let every member",
+      );
+    });
+
+    it("validates an inherited allowlist before enabling it, and rejects unsafe numbers", () => {
+      const { service } = buildDmService({ allowFrom: ["@owner"] });
+      expect(() => update(service, { dmPolicy: "allowlist" })).toThrow(
+        'allowFrom entry "@owner" is not a numeric Telegram user id',
+      );
+      expect(() =>
+        update(service, { dmPolicy: "allowlist", allowFrom: [2 ** 60] }),
+      ).toThrow("allowFrom entries must be strings");
+    });
+
     it("needs no group pin when the account admits no groups", () => {
       const { fsMock, service } = buildDmService();
       update(service, { dmPolicy: "open", allowFrom: ["*"] });
