@@ -1231,6 +1231,22 @@ describe("server/agents/service coverage", () => {
       );
     });
 
+    it("keeps the last agent of an explicit fleet (#126)", () => {
+      const { fsMock, service } = buildService({
+        initialConfig: {
+          agents: {
+            ownership: "explicit",
+            entries: { solo: { workspace: "/tmp/openclaw/workspace-solo" } },
+          },
+        },
+      });
+
+      expect(() => service.deleteAgent("solo")).toThrow(
+        "The only configured agent cannot be deleted",
+      );
+      expect(Object.keys(fsMock.readConfig().agents.entries)).toEqual(["solo"]);
+    });
+
     it("refuses to delete an explicit fleet's ownership targets (#126)", () => {
       const { fsMock, service } = buildService({
         initialConfig: {
