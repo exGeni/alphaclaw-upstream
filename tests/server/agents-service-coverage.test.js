@@ -322,6 +322,7 @@ describe("server/agents/service coverage", () => {
           [{ "no-slash": { agentRuntime: { id: "openclaw" } } }, "is not a provider/model id"],
           [{ "anthropic/claude-sonnet-5-5": { codeMode: "yes" } }, "codeMode must be true or false"],
           [["anthropic/claude-sonnet-5-5"], "models must be an object"],
+          [{ "vllm/*": { codeMode: true } }, "codeMode is not allowed on a wildcard model ref"],
         ];
         for (const [models, message] of cases) {
           await expect(service.updateAgent("reception", { models })).rejects.toThrow(message);
