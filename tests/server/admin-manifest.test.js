@@ -673,3 +673,17 @@ describe("channels.account-update tier", () => {
     expect(tierResolver({ body: { name: "X", agentId: "main" } })).toBe("restart");
   });
 });
+
+describe("agents.update tier", () => {
+  it("escalates moving a model off the embedded openclaw runtime to dangerous", () => {
+    const { tierResolver } = require("../../lib/server/admin-manifest/domains/agents.js").ops.find(
+      (op) => op.id === "agents.update",
+    );
+    const body = (id) => ({ body: { models: { "anthropic/claude-sonnet-5-5": { agentRuntime: { id } } } } });
+    expect(tierResolver(body("openclaw"))).toBe("write");
+    expect(tierResolver(body("claude-cli"))).toBe("dangerous");
+    expect(tierResolver(body("auto"))).toBe("dangerous");
+    expect(tierResolver({ body: { models: { "a/b": null } } })).toBe("write");
+    expect(tierResolver({ body: { name: "X" } })).toBe("write");
+  });
+});
