@@ -696,7 +696,8 @@ describe("agents.update tier", () => {
 describe("agents.update skills tier", () => {
   const { createSkillsTier } = require("../../lib/server/admin-manifest/domains/agents.js");
   const tierFor = (cfg) => createSkillsTier({ readConfig: () => cfg });
-  const req = (skills) => ({ path: "/api/agents/reception", body: { skills } });
+  // Express shape under app.use("/api", enforcement): mount-trimmed path.
+  const req = (skills) => ({ baseUrl: "/api", path: "/agents/reception", body: { skills } });
 
   it("narrowing is write; widening or removing is dangerous", () => {
     const cfg = { agents: { list: [{ id: "reception", skills: ["faq", "grant-intake"] }] } };
@@ -705,7 +706,7 @@ describe("agents.update skills tier", () => {
     expect(tier(req([]))).toBe("write");
     expect(tier(req(["faq", "github"]))).toBe("dangerous");
     expect(tier(req(null))).toBe("dangerous");
-    expect(tier({ path: "/api/agents/reception", body: { name: "X" } })).toBe("write");
+    expect(tier({ baseUrl: "/api", path: "/agents/reception", body: { name: "X" } })).toBe("write");
   });
 
   it("compares against inherited defaults, and any list narrows an unrestricted agent", () => {
@@ -716,11 +717,10 @@ describe("agents.update skills tier", () => {
     expect(unrestricted(req(["anything"]))).toBe("write");
   });
 
-  it("fails closed through resolveTier when the config cannot be read", () => {
-    const manifest = require("../../lib/server/admin-manifest");
-    const op = manifest.findOp("PUT", "/api/agents/reception");
-    expect(op?.id).toBe("agents.update");
-    const throwing = createSkillsTier({ readConfig: () => null });
-    expect(() => throwing(req(["x"]))).toThrow("config unreadable");
+  it("fails closed on unreadable config or a non-list own skills value", () => {
+    expect(() => tierFor(null)(req(["x"]))).toThrow("config unreadable");
+    expect(() =>
+      tierFor({ agents: { list: [{ id: "reception", skills: null }] } })(req(["x"])),
+    ).toThrow("agent skills is not a list");
   });
 });
