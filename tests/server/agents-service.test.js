@@ -2349,6 +2349,57 @@ describe("server/agents/service", () => {
       expect(writeEnvFile).not.toHaveBeenCalled();
     });
 
+    it("refuses \"*\" unless the effective policy is open", () => {
+      const { fsMock, service } = buildDmService();
+      const before = JSON.stringify(fsMock.readConfig());
+      expect(() => update(service, { allowFrom: ["*"] })).toThrow(
+        'allowFrom "*" is only allowed with dmPolicy "open"',
+      );
+      expect(() => update(service, { dmPolicy: "allowlist", allowFrom: ["*", "123"] })).toThrow(
+        'allowFrom "*" is only allowed with dmPolicy "open"',
+      );
+      expect(JSON.stringify(fsMock.readConfig())).toBe(before);
+    });
+
+    it("reads legacy dm.policy / dm.allowFrom and replaces them when writing", () => {
+      const { fsMock, service } = buildDmService();
+      const cfg = fsMock.readConfig();
+      const clients = cfg.channels.telegram.accounts.clients;
+      delete clients.dmPolicy;
+      clients.dm = { policy: "open", allowFrom: ["*"], keep: true };
+      fsMock.writeFileSync("/tmp/openclaw/openclaw.json", JSON.stringify(cfg));
+
+      // Effective policy is the legacy "open": a concrete list alone is refused.
+      expect(() => update(service, { allowFrom: ["123"] })).toThrow(
+        'dmPolicy "open" requires allowFrom to include "*"',
+      );
+
+      update(service, { dmPolicy: "allowlist", allowFrom: ["123"] });
+      const saved = fsMock.readConfig().channels.telegram.accounts.clients;
+      expect(saved).toMatchObject({ dmPolicy: "allowlist", allowFrom: ["123"], dm: { keep: true } });
+      expect(saved.dm).not.toHaveProperty("policy");
+      expect(saved.dm).not.toHaveProperty("allowFrom");
+    });
+
+    it("validates allowFrom: [] against the inherited root list it falls back to", () => {
+      const { fsMock, service } = buildDmService({ allowFrom: ["333333"] });
+      update(service, { dmPolicy: "allowlist", allowFrom: ["444444"] });
+
+      const result = update(service, { dmPolicy: "allowlist", allowFrom: [] });
+
+      expect(result.account).toMatchObject({ dmPolicy: "allowlist", allowFrom: ["333333"] });
+      expect(fsMock.readConfig().channels.telegram.accounts.clients).not.toHaveProperty("allowFrom");
+    });
+
+    it("allows open + \"*\" when the channel-level allowFrom is an empty list", () => {
+      const { fsMock, service } = buildDmService({ allowFrom: [] });
+      update(service, { dmPolicy: "open", allowFrom: ["*"] });
+      expect(fsMock.readConfig().channels.telegram.accounts.clients).toMatchObject({
+        dmPolicy: "open",
+        allowFrom: ["*"],
+      });
+    });
+
     it("refuses DM access fields for providers without account-level support", () => {
       const fsMock = buildFsMock({
         initialConfig: {
