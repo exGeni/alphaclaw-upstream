@@ -2240,8 +2240,6 @@ describe("server/agents/service", () => {
         name: "Clients",
         dmPolicy: "open",
         allowFrom: ["*"],
-        // Group sender auth would otherwise fall back to allowFrom ["*"].
-        groupAllowFrom: [],
       });
       expect(accounts.default).toEqual(before);
     });
@@ -2403,7 +2401,7 @@ describe("server/agents/service", () => {
     });
 
     it("pins Telegram groupAllowFrom to the previous senders so \"*\" does not open groups", () => {
-      const { fsMock, service } = buildDmService();
+      const { fsMock, service } = buildDmService({ groups: { "-1001": {} } });
       const cfg = fsMock.readConfig();
       cfg.channels.telegram.accounts.clients.allowFrom = ["555555"];
       cfg.channels.telegram.accounts.clients.dmPolicy = "allowlist";
@@ -2416,8 +2414,31 @@ describe("server/agents/service", () => {
       ]);
     });
 
+    it("refuses \"*\" when groups are admitted and there is no sender list to pin", () => {
+      const { fsMock, service } = buildDmService({ groups: { "-1001": {} } });
+      const before = JSON.stringify(fsMock.readConfig());
+      expect(() => update(service, { dmPolicy: "open", allowFrom: ["*"] })).toThrow(
+        "would also let every member of this account's Telegram groups command the bot",
+      );
+      expect(JSON.stringify(fsMock.readConfig())).toBe(before);
+    });
+
+    it("needs no group pin when the account admits no groups", () => {
+      const { fsMock, service } = buildDmService();
+      update(service, { dmPolicy: "open", allowFrom: ["*"] });
+      expect(fsMock.readConfig().channels.telegram.accounts.clients).not.toHaveProperty(
+        "groupAllowFrom",
+      );
+    });
+
+    it("treats a channel-level list that already has \"*\" as non-restrictive", () => {
+      const { fsMock, service } = buildDmService({ allowFrom: ["*", "123"] });
+      update(service, { dmPolicy: "open", allowFrom: ["*"] });
+      expect(fsMock.readConfig().channels.telegram.accounts.clients.dmPolicy).toBe("open");
+    });
+
     it("leaves an existing groupAllowFrom alone", () => {
-      const { fsMock, service } = buildDmService({ groupAllowFrom: ["777777"] });
+      const { fsMock, service } = buildDmService({ groupAllowFrom: ["777777"], groups: { "-1001": {} } });
       update(service, { dmPolicy: "open", allowFrom: ["*"] });
       expect(fsMock.readConfig().channels.telegram.accounts.clients).not.toHaveProperty(
         "groupAllowFrom",

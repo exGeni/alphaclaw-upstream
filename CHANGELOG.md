@@ -16,7 +16,7 @@ Versions follow this repository's `package.json` release counter.
     - `"*"` is allowed only with `open`;
     - `allowlist` requires a sender id;
     - Telegram refuses `open` under a channel-level allowlist.
-  - On Telegram, `"*"` pins `groupAllowFrom` to the previous sender list when none is set, so group access does not widen.
+  - On Telegram, `"*"` must not widen group access. Group sender auth falls back to `allowFrom`, so when the account admits groups and has no explicit `groupAllowFrom`, it is pinned to the previous sender list. If there is none, the request is refused.
   - Making an account public is a dangerous-tier admin op (confirm code).
   - Nothing is written when validation fails, and no restart is needed.
 
