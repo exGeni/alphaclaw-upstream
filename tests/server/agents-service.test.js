@@ -2423,6 +2423,22 @@ describe("server/agents/service", () => {
       expect(JSON.stringify(fsMock.readConfig())).toBe(before);
     });
 
+    it("honours channels.defaults.groupPolicy \"open\" when deciding whether groups are admitted", () => {
+      const { fsMock, service } = buildDmService();
+      const cfg = fsMock.readConfig();
+      cfg.channels.defaults = { groupPolicy: "open" };
+      fsMock.writeFileSync("/tmp/openclaw/openclaw.json", JSON.stringify(cfg));
+      expect(() => update(service, { dmPolicy: "open", allowFrom: ["*"] })).toThrow(
+        "would also let every member",
+      );
+    });
+
+    it("reads a padded inherited \" * \" as a wildcard", () => {
+      const { fsMock, service } = buildDmService({ allowFrom: [" * ", "123"] });
+      update(service, { dmPolicy: "open", allowFrom: ["*"] });
+      expect(fsMock.readConfig().channels.telegram.accounts.clients.dmPolicy).toBe("open");
+    });
+
     it("needs no group pin when the account admits no groups", () => {
       const { fsMock, service } = buildDmService();
       update(service, { dmPolicy: "open", allowFrom: ["*"] });
