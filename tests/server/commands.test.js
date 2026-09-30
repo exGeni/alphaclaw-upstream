@@ -113,6 +113,30 @@ describe("server/commands", () => {
     expect(runningLog[0]).not.toContain("ghp_secret123");
   });
 
+  it("keeps multi-byte UTF-8 clawCmd output intact across chunk boundaries", async () => {
+    const { PassThrough } = require("stream");
+    const spawnMock = vi.fn(() => {
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = vi.fn();
+      const bytes = Buffer.from("aé", "utf8"); // 61 c3 a9
+      setImmediate(() => {
+        child.stdout.write(bytes.subarray(0, 2)); // splits "é"
+        child.stdout.end(bytes.subarray(2));
+        child.stderr.end();
+        setImmediate(() => child.emit("close", 0, null));
+      });
+      return child;
+    });
+    const { createCommands } = loadCommandsModule({ spawnMock });
+    const { clawCmd } = createCommands({ gatewayEnv: () => ({}) });
+
+    const result = await clawCmd("x", { quiet: true });
+
+    expect(result).toMatchObject({ ok: true, stdout: "aé" });
+  });
+
   it("logs clawCmd failures when not quiet", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const spawnMock = vi.fn(() => makeFakeChild({ code: 2, stderr: "bad flag\n" }));
