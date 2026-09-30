@@ -994,6 +994,12 @@ describe("server/agents/service", () => {
     expect(clawCmd.mock.calls[0][0]).toBe(
       "channels add --channel 'telegram' --account 'clients' --name 'Clients' --token '${TELEGRAM_BOT_TOKEN_CLIENTS}'",
     );
+    // The saved account carries the same reference, never the secret.
+    const saved = JSON.stringify(fsMock.readConfig());
+    expect(saved).not.toContain("secret-bot-token");
+    expect(fsMock.readConfig().channels.telegram.accounts.clients.botToken).toBe(
+      "${TELEGRAM_BOT_TOKEN_CLIENTS}",
+    );
   });
 
   it("uses ALPHACLAW_CHANNEL_CMD_TIMEOUT_MS for channel add/bind CLIs", async () => {
