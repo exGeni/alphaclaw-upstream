@@ -2292,6 +2292,63 @@ describe("server/agents/service", () => {
       expect(clients).not.toHaveProperty("allowFrom");
     });
 
+    it("keeps an inherited channel-level policy when only allowFrom is sent", () => {
+      const { fsMock, service } = buildDmService({ dmPolicy: "disabled" });
+      // "clients" has its own dmPolicy in the fixture; drop it to inherit.
+      const cfg = fsMock.readConfig();
+      delete cfg.channels.telegram.accounts.clients.dmPolicy;
+      fsMock.writeFileSync("/tmp/openclaw/openclaw.json", JSON.stringify(cfg));
+
+      const result = update(service, { allowFrom: ["222222"] });
+
+      expect(result.account.dmPolicy).toBe("disabled");
+      const clients = fsMock.readConfig().channels.telegram.accounts.clients;
+      expect(clients).not.toHaveProperty("dmPolicy");
+      expect(clients.allowFrom).toEqual(["222222"]);
+    });
+
+    it("validates against an inherited channel-level allowFrom", () => {
+      const { service } = buildDmService({ allowFrom: ["333333"] });
+      expect(update(service, { dmPolicy: "allowlist" }).account).toMatchObject({
+        dmPolicy: "allowlist",
+        allowFrom: ["333333"],
+      });
+    });
+
+    it("writes no token when the DM access fields are invalid", () => {
+      const fsMock = buildFsMock({
+        initialConfig: {
+          agents: { list: [{ id: "main", default: true }] },
+          channels: {
+            telegram: {
+              enabled: true,
+              accounts: { clients: { botToken: "${TELEGRAM_BOT_TOKEN_CLIENTS}", name: "Clients" } },
+            },
+          },
+        },
+      });
+      const writeEnvFile = vi.fn();
+      const service = createAgentsService({
+        fs: fsMock,
+        OPENCLAW_DIR: "/tmp/openclaw",
+        readEnvFile: vi.fn(() => []),
+        writeEnvFile,
+        reloadEnv: vi.fn(),
+      });
+
+      expect(() =>
+        service.updateChannelAccount({
+          provider: "telegram",
+          accountId: "clients",
+          name: "Clients",
+          agentId: "main",
+          token: "123:new-token",
+          dmPolicy: "open",
+        }),
+      ).toThrow('requires allowFrom to include "*"');
+      expect(writeEnvFile).not.toHaveBeenCalled();
+    });
+
     it("refuses DM access fields for providers without account-level support", () => {
       const fsMock = buildFsMock({
         initialConfig: {
