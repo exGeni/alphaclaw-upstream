@@ -2452,14 +2452,40 @@ describe("server/agents/service", () => {
       );
     });
 
-    it("inherits root groups when the account's groups map is empty", () => {
+    it("an empty own groups map replaces the root's in a multi-account config", () => {
+      // buildDmService has two accounts (default, clients).
       const { fsMock, service } = buildDmService({ groups: { "-1001": {} } });
       const cfg = fsMock.readConfig();
       cfg.channels.telegram.accounts.clients.groups = {};
       fsMock.writeFileSync("/tmp/openclaw/openclaw.json", JSON.stringify(cfg));
-      expect(() => update(service, { dmPolicy: "open", allowFrom: ["*"] })).toThrow(
-        "would also let every member",
-      );
+      update(service, { dmPolicy: "open", allowFrom: ["*"] });
+      expect(fsMock.readConfig().channels.telegram.accounts.clients.dmPolicy).toBe("open");
+    });
+
+    it("an empty own groups map inherits the root's in a single-account config", () => {
+      const fsMock = buildFsMock({
+        initialConfig: {
+          agents: { list: [{ id: "main", default: true }] },
+          channels: {
+            telegram: {
+              enabled: true,
+              groups: { "-1001": {} },
+              accounts: { clients: { botToken: "${TELEGRAM_BOT_TOKEN_CLIENTS}", name: "Clients", groups: {} } },
+            },
+          },
+        },
+      });
+      const service = createAgentsService({ fs: fsMock, OPENCLAW_DIR: "/tmp/openclaw" });
+      expect(() =>
+        service.updateChannelAccount({
+          provider: "telegram",
+          accountId: "clients",
+          name: "Clients",
+          agentId: "main",
+          dmPolicy: "open",
+          allowFrom: ["*"],
+        }),
+      ).toThrow("would also let every member");
     });
 
     it("validates an inherited allowlist before enabling it, and rejects unsafe numbers", () => {
