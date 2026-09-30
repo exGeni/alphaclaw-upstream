@@ -5,6 +5,15 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.9.98] - 2026-09-30
+
+### Added
+
+- **Channel account DM access through AlphaClaw:** `PUT /api/channels/accounts` (admin op `channels.account-update`) accepts optional `dmPolicy` (`pairing`/`allowlist`/`open`/`disabled`) and `allowFrom` for Telegram, Discord and Slack accounts. Operators no longer need `openclaw config set` to make an account public or change its DM allowlist.
+  - The rules follow OpenClaw's access-control docs: `open` requires `"*"`, `allowlist` requires a sender id, and `open` is refused under a restrictive channel-level `allowFrom`.
+  - AlphaClaw enforces these rules itself, because OpenClaw 2026.9.5 does not check them per account.
+  - Nothing is written when validation fails, and no restart is needed.
+
 ## [0.9.97] - 2026-09-30
 
 ### Fixed
