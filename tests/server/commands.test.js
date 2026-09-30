@@ -397,12 +397,19 @@ describe("server/commands clawCmd timeout kills the whole process group", () => 
   const os = require("os");
   const path = require("path");
   let dir;
+  // Zombies (exited, not yet reaped) cannot write: count them as gone.
   const isAlive = (pid) => {
     try {
       process.kill(pid, 0);
-      return true;
     } catch {
       return false;
+    }
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+      return state !== "Z" && state !== "X";
+    } catch {
+      return true;
     }
   };
   const writeFakeOpenclaw = (body) => {
@@ -414,7 +421,23 @@ describe("server/commands clawCmd timeout kills the whole process group", () => 
       .readFileSync(path.join(dir, "pids"), "utf8")
       .trim()
       .split(/\s+/)
+      .filter(Boolean)
       .map(Number);
+  const waitFor = async (predicate, ms) => {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      if (predicate()) return true;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return predicate();
+  };
+  const loadClawCmd = () => {
+    delete require.cache[modulePath];
+    const { createCommands } = require(modulePath);
+    return createCommands({
+      gatewayEnv: () => ({ ...process.env, PATH: `${dir}:${process.env.PATH}` }),
+    }).clawCmd;
+  };
 
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawcmd-group-"));
@@ -428,15 +451,9 @@ describe("server/commands clawCmd timeout kills the whole process group", () => 
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  const gatewayEnv = () => ({ ...process.env, PATH: `${dir}:${process.env.PATH}` });
-
   it("leaves no openclaw grandchild alive after a timeout", async () => {
-    writeFakeOpenclaw(
-      `sleep 30 &\necho "$$ $!" > "${dir}/pids"\nwait`,
-    );
-    delete require.cache[modulePath];
-    const { createCommands } = require(modulePath);
-    const { clawCmd } = createCommands({ gatewayEnv });
+    writeFakeOpenclaw(`sleep 30 &\necho "$$ $!" > "${dir}/pids"\nwait`);
+    const clawCmd = loadClawCmd();
 
     const result = await clawCmd("channels add --channel telegram", {
       quiet: true,
@@ -449,13 +466,16 @@ describe("server/commands clawCmd timeout kills the whole process group", () => 
     for (const pid of pids) expect(isAlive(pid)).toBe(false);
   });
 
-  it("SIGKILLs a group that ignores the timeout signal after the grace period", async () => {
+  it("SIGKILLs a group that ignores the timeout signal once the grace period ends", async () => {
     writeFakeOpenclaw(
-      `trap '' TERM\nsh -c 'trap "" TERM; sleep 30' &\necho "$$ $!" > "${dir}/pids"\nwait`,
+      [
+        "trap '' TERM",
+        `sh -c 'trap "" TERM; sleep 30 & echo $! >> "${dir}/pids"; echo $$ >> "${dir}/pids"; wait' &`,
+        `echo $$ >> "${dir}/pids"`,
+        "wait",
+      ].join("\n"),
     );
-    delete require.cache[modulePath];
-    const { createCommands } = require(modulePath);
-    const { clawCmd } = createCommands({ gatewayEnv });
+    const clawCmd = loadClawCmd();
 
     const startedAt = Date.now();
     const result = await clawCmd("pairing list --channel telegram --json", {
@@ -463,24 +483,69 @@ describe("server/commands clawCmd timeout kills the whole process group", () => 
       timeoutMs: 300,
       killGraceMs: 400,
     });
+    const elapsed = Date.now() - startedAt;
 
     expect(result).toMatchObject({ ok: false, timedOut: true });
-    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(300);
-    for (const pid of readPids()) expect(isAlive(pid)).toBe(false);
+    // Nothing honours SIGTERM, so only the SIGKILL at timeout + grace ends it.
+    expect(elapsed).toBeGreaterThanOrEqual(650);
+    const pids = readPids();
+    expect(pids).toHaveLength(3); // outer sh, inner sh, sleep
+    expect(await waitFor(() => pids.every((pid) => !isAlive(pid)), 2000)).toBe(true);
   });
 
-  it("returns a fast command's output unchanged and arms no kill", async () => {
+  it("settles after the grace period even when a setsid'd descendant holds the pipes", async () => {
+    writeFakeOpenclaw(`setsid sleep 30 &\necho "$!" > "${dir}/pids"\nwait`);
+    const clawCmd = loadClawCmd();
+
+    const startedAt = Date.now();
+    const result = await clawCmd("x", { quiet: true, timeoutMs: 300, killGraceMs: 300 });
+
+    expect(result).toMatchObject({ ok: false, timedOut: true });
+    expect(Date.now() - startedAt).toBeLessThan(5000);
+  });
+
+  it("killScope leader keeps the CLI running past the call (WhatsApp QR login)", async () => {
+    writeFakeOpenclaw(
+      `echo QR-BLOCK\nsleep 1\necho linked > "${dir}/marker"\necho $$ > "${dir}/pids"`,
+    );
+    const clawCmd = loadClawCmd();
+
+    const result = await clawCmd("channels login --channel whatsapp", {
+      quiet: true,
+      timeoutMs: 300,
+      killSignal: "SIGKILL",
+      killScope: "leader",
+    });
+
+    expect(result).toMatchObject({ ok: false, timedOut: true, stdout: "QR-BLOCK" });
+    expect(await waitFor(() => fs.existsSync(path.join(dir, "marker")), 5000)).toBe(true);
+  });
+
+  it("fails an output overflow like exec's maxBuffer (reads as a timeout)", async () => {
+    writeFakeOpenclaw(`head -c 5000 /dev/zero | tr '\\0' x\nsleep 30`);
+    const clawCmd = loadClawCmd();
+
+    const result = await clawCmd("x", { quiet: true, timeoutMs: 10000, maxBuffer: 1000 });
+
+    expect(result).toMatchObject({
+      ok: false,
+      code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+      killed: true,
+      timedOut: true,
+    });
+  });
+
+  it("returns a fast command's output unchanged, with no code on success", async () => {
     writeFakeOpenclaw(`echo "out:$*"\necho err >&2`);
-    delete require.cache[modulePath];
-    const { createCommands } = require(modulePath);
-    const { clawCmd } = createCommands({ gatewayEnv });
+    const clawCmd = loadClawCmd();
 
     const result = await clawCmd("pairing list --json", { quiet: true, timeoutMs: 5000 });
 
-    expect(result).toMatchObject({
+    expect(result).toEqual({
       ok: true,
       stdout: "out:pairing list --json",
       stderr: "err",
+      code: undefined,
     });
   });
 });
