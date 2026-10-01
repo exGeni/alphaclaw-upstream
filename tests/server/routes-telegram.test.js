@@ -499,12 +499,18 @@ describe("server/routes/telegram", () => {
       expect(telegramApi.editForumTopic).not.toHaveBeenCalled();
       expect(readRegistryFile().groups["-100"].topics["5"]).toEqual({ name: "Ops" });
 
+      // OpenClaw canonicalizes agent ids (trim + lowercase), so " MAIN " names main.
+      const canonical = await request(app)
+        .put("/api/telegram/groups/-100/topics/5")
+        .send({ name: "Ops", agentId: " MAIN " });
+      expect(canonical.body.ok).toBe(true);
+
       // A known agent and an empty id (unroute) are accepted.
       const ok = await request(app)
         .put("/api/telegram/groups/-100/topics/5")
         .send({ name: "Ops", agentId: "main" });
       expect(ok.body.ok).toBe(true);
-      expect(ok.body.topicChanges).toEqual({ removed: [], added: ["5"], changed: [] });
+      expect(ok.body.topicChanges).toEqual({ removed: [], added: [], changed: ["5"] });
       const unroute = await request(app)
         .put("/api/telegram/groups/-100/topics/5")
         .send({ name: "Ops", agentId: "" });

@@ -272,7 +272,7 @@ describe("server/agents/service coverage", () => {
                   "-100": {
                     topics: {
                       "16": { agentId: "dispatcher" },
-                      "17": { agentId: "dispatcher", systemPrompt: "keep me" },
+                      "17": { agentId: "Dispatcher", systemPrompt: "keep me" },
                       "39": { agentId: "main" },
                     },
                   },
@@ -290,7 +290,6 @@ describe("server/agents/service coverage", () => {
 
       it("clears topic agentId in openclaw.json and in the registry, and reports both", () => {
         const registry = {
-          getActiveTopicCountStrict: vi.fn(() => 3),
           clearAgentReferences: vi.fn(() => [{ groupId: "-100", threadId: "16" }]),
         };
         const { fsMock, service } = build(registry);
@@ -315,17 +314,17 @@ describe("server/agents/service coverage", () => {
         });
       });
 
-      it("refuses the delete (nothing written) when the topic registry is unreadable", () => {
+      it("refuses the delete (openclaw.json untouched, retryable) when the registry clear fails", () => {
         const registry = {
-          getActiveTopicCountStrict: vi.fn(() => {
+          clearAgentReferences: vi.fn(() => {
             throw new Error("Refusing to touch topic-registry.json: file exists but is not valid JSON");
           }),
-          clearAgentReferences: vi.fn(),
         };
         const { fsMock, service } = build(registry);
         expect(() => service.deleteAgent("dispatcher")).toThrow("not valid JSON");
-        expect(fsMock.readConfig().agents.list.map((a) => a.id)).toContain("dispatcher");
-        expect(registry.clearAgentReferences).not.toHaveBeenCalled();
+        const cfg = fsMock.readConfig();
+        expect(cfg.agents.list.map((a) => a.id)).toContain("dispatcher");
+        expect(cfg.channels.telegram.groups["-100"].topics["16"]).toEqual({ agentId: "dispatcher" });
       });
     });
 
