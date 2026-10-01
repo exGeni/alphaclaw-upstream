@@ -296,6 +296,7 @@ describe("server/routes/telegram", () => {
     });
 
     it("creates a topic, updates the registry and syncs config", async () => {
+      writeOpenclawJson({ agents: { list: [{ id: "main" }, { id: "scout" }] } });
       const { app, telegramApi, syncPromptFiles, shellCmd } = createApp();
 
       const res = await request(app)
@@ -307,7 +308,7 @@ describe("server/routes/telegram", () => {
           agentId: "scout",
         });
 
-      expect(res.body).toEqual({
+      expect(res.body).toMatchObject({
         ok: true,
         topic: {
           threadId: 5,
@@ -316,6 +317,7 @@ describe("server/routes/telegram", () => {
           agentId: "scout",
         },
         syncWarning: null,
+        topicChanges: { removed: [], added: ["5"], changed: [] },
       });
       expect(telegramApi.createForumTopic).toHaveBeenCalledWith("-100", "Ops", {
         iconColor: 7322096,
@@ -423,6 +425,7 @@ describe("server/routes/telegram", () => {
     });
 
     it("creates topics in bulk with per-topic results", async () => {
+      writeOpenclawJson({ agents: { list: [{ id: "main" }, { id: "scout" }] } });
       let nextThread = 10;
       const telegramApi = makeTelegramApi({
         createForumTopic: vi.fn(async (chatId, name) => {
@@ -470,6 +473,46 @@ describe("server/routes/telegram", () => {
     });
   });
 
+  describe("topic agentId must name a configured agent (0.9.95-exgenius.7)", () => {
+    it("create, bulk and update refuse an unknown agent before any Telegram call or write", async () => {
+      writeOpenclawJson({ agents: { list: [{ id: "main" }] } });
+      writeRegistryFile({ version: 2, meta: { sweepWatermark: 0 }, groups: { "-100": { name: "G", topics: { 5: { name: "Ops" } } } } });
+      const { app, telegramApi } = createApp();
+
+      const create = await request(app)
+        .post("/api/telegram/groups/-100/topics")
+        .send({ name: "New", agentId: "dispatcher-ghost" });
+      expect(create.status).toBe(400);
+      expect(create.body.error).toContain('Unknown agent "dispatcher-ghost"');
+
+      const bulk = await request(app)
+        .post("/api/telegram/groups/-100/topics/bulk")
+        .send({ topics: [{ name: "A", agentId: "main" }, { name: "B", agentId: "ghost" }] });
+      expect(bulk.status).toBe(400);
+
+      const update = await request(app)
+        .put("/api/telegram/groups/-100/topics/5")
+        .send({ name: "Renamed", agentId: "ghost" });
+      expect(update.status).toBe(400);
+
+      expect(telegramApi.createForumTopic).not.toHaveBeenCalled();
+      expect(telegramApi.editForumTopic).not.toHaveBeenCalled();
+      expect(readRegistryFile().groups["-100"].topics["5"]).toEqual({ name: "Ops" });
+
+      // A known agent and an empty id (unroute) are accepted.
+      const ok = await request(app)
+        .put("/api/telegram/groups/-100/topics/5")
+        .send({ name: "Ops", agentId: "main" });
+      expect(ok.body.ok).toBe(true);
+      expect(ok.body.topicChanges).toEqual({ removed: [], added: ["5"], changed: [] });
+      const unroute = await request(app)
+        .put("/api/telegram/groups/-100/topics/5")
+        .send({ name: "Ops", agentId: "" });
+      expect(unroute.body.ok).toBe(true);
+      expect(unroute.body.topicChanges).toEqual({ removed: ["5"], added: [], changed: [] });
+    });
+  });
+
   describe("DELETE /api/telegram/groups/:groupId/topics/:topicId", () => {
     it("deletes a topic from telegram and tombstones the registry entry", async () => {
       writeRegistryFile({
@@ -479,7 +522,11 @@ describe("server/routes/telegram", () => {
 
       const res = await request(app).delete("/api/telegram/groups/-100/topics/5");
 
-      expect(res.body).toEqual({ ok: true, syncWarning: null });
+      expect(res.body).toEqual({
+        ok: true,
+        syncWarning: null,
+        topicChanges: { removed: [], added: [], changed: [] },
+      });
       expect(telegramApi.deleteForumTopic).toHaveBeenCalledWith("-100", 5);
       expect(readRegistryFile().groups["-100"].topics["5"]).toEqual({
         name: "Ops",
@@ -515,7 +562,7 @@ describe("server/routes/telegram", () => {
 
       const res = await request(app).delete("/api/telegram/groups/-100/topics/5");
 
-      expect(res.body).toEqual({
+      expect(res.body).toMatchObject({
         ok: true,
         removedFromRegistryOnly: true,
         warning:
@@ -682,6 +729,7 @@ describe("server/routes/telegram", () => {
     });
 
     it("renames a topic and updates instructions and agent routing", async () => {
+      writeOpenclawJson({ agents: { list: [{ id: "main" }, { id: "scout" }] } });
       writeRegistryFile({
         groups: { "-100": { name: "G", topics: { 5: { name: "Old" } } } },
       });
@@ -691,7 +739,7 @@ describe("server/routes/telegram", () => {
         .put("/api/telegram/groups/-100/topics/5")
         .send({ name: "New", systemInstructions: "sys", agentId: "scout" });
 
-      expect(res.body).toEqual({
+      expect(res.body).toMatchObject({
         ok: true,
         topic: {
           threadId: 5,
@@ -809,7 +857,7 @@ describe("server/routes/telegram", () => {
         .post("/api/telegram/groups/-100/configure?accountId=work")
         .send({ userId: " 99 ", groupName: "My Group", requireMention: "true" });
 
-      expect(res.body).toEqual({ ok: true, userId: "99", syncWarning: null });
+      expect(res.body).toMatchObject({ ok: true, userId: "99", syncWarning: null });
       expect(telegramApi.getChatAdministrators).not.toHaveBeenCalled();
       const cfg = readOpenclawJson();
       expect(cfg.channels.telegram.groups["-100"]).toEqual({
@@ -837,7 +885,7 @@ describe("server/routes/telegram", () => {
         .post("/api/telegram/groups/-100/configure")
         .send({});
 
-      expect(res.body).toEqual({ ok: true, userId: "7", syncWarning: null });
+      expect(res.body).toMatchObject({ ok: true, userId: "7", syncWarning: null });
       expect(telegramApi.getChatAdministrators).toHaveBeenCalledWith("-100");
       const cfg = readOpenclawJson();
       expect(cfg.channels.telegram.groupAllowFrom).toEqual(["7"]);
@@ -862,7 +910,7 @@ describe("server/routes/telegram", () => {
         .post("/api/telegram/groups/-100/configure?accountId=work")
         .send({});
 
-      expect(res.body).toEqual({ ok: true, userId: null, syncWarning: null });
+      expect(res.body).toMatchObject({ ok: true, userId: null, syncWarning: null });
       expect(readRegistryFile().groups["-100"]).toEqual({
         channel: "telegram",
         name: "-100",
@@ -1434,6 +1482,7 @@ describe("server/routes/telegram", () => {
   describe("fix wave PR 8b: topic PUT registers discovered topics; workspace repair is quiet without an admin", () => {
     it("naming a DISCOVERED topic clears discovered + cache nameSource and syncs its routing into openclaw.json (F090)", async () => {
       writeOpenclawJson({
+        agents: { list: [{ id: "main" }, { id: "ops" }] },
         channels: { telegram: { groups: { "-100": { requireMention: true } } } },
       });
       writeRegistryFile({

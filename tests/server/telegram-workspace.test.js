@@ -247,6 +247,8 @@ describe("server/telegram-workspace", () => {
       maxConcurrent: 8,
       subagentMaxConcurrent: 6,
       actionsChanged: true,
+      topicChanges: { removed: [], added: [], changed: [] },
+      danglingAgentTopics: [],
     });
     const nextConfig = readOpenclawConfig({ dir: openclawDir });
     const group = nextConfig.channels.telegram.groups["-100999"];
@@ -668,5 +670,43 @@ describe("server/telegram-workspace resolveAccountIdForGroup", () => {
     expect(
       resolveAccountIdForGroup({ cfg: cfgWithAccounts, groupId: "" }),
     ).toBeNull();
+  });
+});
+
+describe("syncConfigForTelegram reports what the topic rebuild changed (0.9.95-exgenius.7)", () => {
+  it("reports a config-only topic it drops, a registry topic it re-adds, and routes to unknown agents", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "alphaclaw-topic-report-"));
+    fs.writeFileSync(
+      path.join(dir, "openclaw.json"),
+      JSON.stringify({
+        agents: { list: [{ id: "main" }] },
+        channels: {
+          telegram: {
+            groups: {
+              "-100": {
+                topics: {
+                  "14": { agentId: "main" },
+                  "39": { agentId: "main", systemPrompt: "config only" },
+                },
+              },
+            },
+          },
+        },
+      }),
+    );
+    const topicRegistry = {
+      getGroupStrict: () => ({
+        topics: {
+          "14": { name: "A", agentId: "main" },
+          "16": { name: "B", agentId: "dispatcher-ghost" },
+          "39": { name: "C", discovered: true },
+        },
+      }),
+      getActiveTopicCountStrict: () => 2,
+    };
+    const result = syncConfigForTelegram({ fs, openclawDir: dir, topicRegistry, groupId: "-100" });
+    expect(result.topicChanges).toEqual({ removed: ["39"], added: ["16"], changed: [] });
+    expect(result.danglingAgentTopics).toEqual([{ threadId: "16", agentId: "dispatcher-ghost" }]);
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });
