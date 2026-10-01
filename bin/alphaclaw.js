@@ -774,7 +774,7 @@ const syncTelegramWorkspaceArtifacts = ({
   if (changes) console.log(`[alphaclaw] Topic config changes: ${changes}`);
   for (const t of syncResult.danglingAgentTopics || []) {
     console.warn(
-      `[alphaclaw] Warning: topic ${t.threadId} routes to unknown agent "${t.agentId}"`,
+      `[alphaclaw] Warning: topic ${t.threadId} not written: it routes to unknown agent "${t.agentId}"`,
     );
   }
 };

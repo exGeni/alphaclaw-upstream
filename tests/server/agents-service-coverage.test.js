@@ -314,6 +314,21 @@ describe("server/agents/service coverage", () => {
         });
       });
 
+      it("puts the registry routes back when the config write fails (codex)", () => {
+        const registry = {
+          clearAgentReferences: vi.fn(() => [{ groupId: "-100", threadId: "16", agentId: "dispatcher" }]),
+          updateTopic: vi.fn(),
+        };
+        const { fsMock, service } = build(registry);
+        fsMock.writeFileSync.mockImplementation(() => {
+          throw new Error("disk full");
+        });
+        expect(() => service.deleteAgent("dispatcher")).toThrow();
+        expect(registry.updateTopic).toHaveBeenCalledWith("-100", "16", { agentId: "dispatcher" }, {
+          source: "agent-delete-rollback",
+        });
+      });
+
       it("refuses the delete (openclaw.json untouched, retryable) when the registry clear fails", () => {
         const registry = {
           clearAgentReferences: vi.fn(() => {

@@ -12,7 +12,8 @@ Versions follow this repository's `package.json` release counter.
 - **Telegram topics can no longer route to an agent that does not exist.** OpenClaw 2026.9.5 uses a topic `agentId` as is, and `openclaw config validate` accepts one that names no agent.
   - Topic writes (`POST`/`PUT /api/telegram/groups/:g/topics…`, `…/topics/bulk`, `alphaclaw telegram topic add|create --agent`) refuse an id that is not a configured agent (400 / exit 1) before any Telegram call or write. Ids compare in OpenClaw's canonical form; an empty id still unroutes.
   - `agents.delete` unroutes the agent's topics in the topic registry and in `openclaw.json` and returns them in `unroutedTopics`. A registry that cannot be cleared refuses the delete, which stays retryable.
-- **Topic syncs no longer drop config silently.** `syncConfigForTelegram` rebuilds a group's topics from the registry; every topic write now returns `topicChanges` (removed/added/changed thread ids) and `danglingAgentTopics`, and the CLI prints them.
+- **Topic syncs no longer drop config silently.** `syncConfigForTelegram` rebuilds a group's topics from the registry; every topic write now returns `topicChanges` (removed/added/changed thread ids) and `danglingAgentTopics`, and the CLI prints them. A registry topic routed to an unknown agent is no longer written to `openclaw.json` (decided under the config lock, so a concurrent agent delete cannot slip one in); it is reported in `danglingAgentTopics`.
+- Corrupt `openclaw.json`/topic registry on these paths answers the fail-closed 503, and a failed config write during `agents.delete` puts the registry routes back.
 
 ## [0.9.95-exgenius.6] - 2026-10-01
 
