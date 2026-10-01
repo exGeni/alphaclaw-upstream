@@ -169,7 +169,7 @@ describe("agent-admin composed enforcement (confirm flow + audit + redaction + h
       const narrow = await withBearer(
         request(app)
           .put("/api/agents/reception")
-          .send({ tools: { profile: "minimal", deny: ["exec", "write"], fs: { workspaceOnly: true } } }),
+          .send({ tools: { profile: "messaging", deny: ["exec", "write"], fs: { workspaceOnly: true } } }),
       );
       expect(narrow.status).toBe(200);
 

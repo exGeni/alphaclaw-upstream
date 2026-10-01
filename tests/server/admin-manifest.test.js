@@ -755,20 +755,21 @@ describe("agents.update tools tier", () => {
     expect(globalWide(req({ profile: "minimal" }))).toBe("dangerous");
   });
 
-  it("profile: a stricter effective profile is write, a broader or incomparable one is dangerous", () => {
+  it("profile: unchanged or moving away from full is write; any other change is dangerous (plugins may declare tools per profile, codex)", () => {
     const tier = tierFor(withTools({ profile: "coding" }));
-    expect(tier(req({ profile: "minimal" }))).toBe("write");
     expect(tier(req({ profile: "coding" }))).toBe("write");
+    expect(tier(req({ profile: "minimal" }))).toBe("dangerous");
     expect(tier(req({ profile: "messaging" }))).toBe("dangerous");
     expect(tier(req({ profile: "full" }))).toBe("dangerous");
-    expect(tier(req({}))).toBe("dangerous"); // unset profile: core tools unfiltered
+    expect(tier(req({}))).toBe("dangerous");
+    const full = tierFor(withTools({ profile: "full" }));
+    expect(full(req({ profile: "minimal" }))).toBe("write");
     // Unset agent profile inherits tools.profile.
     const inherits = tierFor(withTools(undefined, { profile: "messaging" }));
-    expect(inherits(req({ profile: "minimal" }))).toBe("write");
+    expect(inherits(req({ profile: "messaging", deny: ["exec"] }))).toBe("write");
     expect(inherits(req({ profile: "coding" }))).toBe("dangerous");
     const unrestricted = tierFor(withTools(undefined));
-    expect(unrestricted(req({ profile: "coding" }))).toBe("write");
-    expect(unrestricted(req({ profile: "full" }))).toBe("dangerous");
+    expect(unrestricted(req({ profile: "coding" }))).toBe("dangerous");
   });
 
   it("allow: adding a strict list or shrinking it is write; growing or removing it is dangerous", () => {
@@ -780,18 +781,6 @@ describe("agents.update tools tier", () => {
     expect(strict(req({ profile: "messaging" }))).toBe("write"); // omitted allow is kept
     expect(strict(req({ profile: "messaging", allow: null }))).toBe("dangerous");
     expect(strict(req({ profile: "messaging", alsoAllow: ["message"] }))).toBe("dangerous");
-  });
-
-  it("a new allow list is write only for core tools: a plugin tool, group:plugins or * may opt in an optional plugin tool (refuter)", () => {
-    const unset = tierFor(withTools(undefined));
-    expect(unset(req({ allow: ["read", "group:messaging"] }))).toBe("write");
-    expect(unset(req({ allow: ["optional_plugin_tool"] }))).toBe("dangerous");
-    expect(unset(req({ allow: ["group:plugins"] }))).toBe("dangerous");
-    expect(unset(req({ allow: ["*"] }))).toBe("dangerous");
-    expect(unset(req({ allow: ["read", "*"] }))).toBe("dangerous");
-    // Already granted through the effective alsoAllow: no new opt-in.
-    const granted = tierFor(withTools({ profile: "minimal", alsoAllow: ["optional_plugin_tool", "read"] }));
-    expect(granted(req({ profile: "minimal", allow: ["optional_plugin_tool"] }))).toBe("write");
   });
 
   it("a new allow list is write only for core tools: a plugin tool, group:plugins or * may opt in an optional plugin tool (refuter)", () => {
@@ -827,7 +816,7 @@ describe("agents.update tools tier", () => {
 
   it("keeps keys AlphaClaw does not manage, so a narrowing patch beside them stays write", () => {
     const tier = tierFor(withTools({ profile: "coding", elevated: { enabled: false } }));
-    expect(tier(req({ profile: "minimal" }))).toBe("write");
+    expect(tier(req({ profile: "coding", deny: ["exec"] }))).toBe("write");
   });
 
   it("compares a rosterless implicit agent against agents.defaults.tools", () => {
