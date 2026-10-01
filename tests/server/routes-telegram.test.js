@@ -519,6 +519,17 @@ describe("server/routes/telegram", () => {
     });
   });
 
+  it("an unparseable openclaw.json makes a topic agentId check fail closed (503), not a 400 (codex)", async () => {
+    fs.mkdirSync(OPENCLAW_DIR, { recursive: true });
+    fs.writeFileSync(kOpenclawJsonPath, "{not json");
+    const { app, telegramApi } = createApp();
+    const res = await request(app)
+      .post("/api/telegram/groups/-100/topics")
+      .send({ name: "New", agentId: "main" });
+    expect(res.status).toBe(503);
+    expect(telegramApi.createForumTopic).not.toHaveBeenCalled();
+  });
+
   describe("DELETE /api/telegram/groups/:groupId/topics/:topicId", () => {
     it("deletes a topic from telegram and tombstones the registry entry", async () => {
       writeRegistryFile({
