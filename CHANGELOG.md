@@ -5,6 +5,15 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.9.95-exgenius.7] - 2026-10-01
+
+### Fixed
+
+- **Telegram topics can no longer route to an agent that does not exist.** OpenClaw 2026.9.5 uses a topic `agentId` as is, and `openclaw config validate` accepts one that names no agent.
+  - Topic writes (`POST`/`PUT /api/telegram/groups/:g/topics…`, `…/topics/bulk`, `alphaclaw telegram topic add|create --agent`) refuse an id that is not a configured agent (400 / exit 1) before any Telegram call or write. Ids compare in OpenClaw's canonical form; an empty id still unroutes.
+  - `agents.delete` unroutes the agent's topics in the topic registry and in `openclaw.json` and returns them in `unroutedTopics`. A registry that cannot be cleared refuses the delete, which stays retryable.
+- **Topic syncs no longer drop config silently.** `syncConfigForTelegram` rebuilds a group's topics from the registry; every topic write now returns `topicChanges` (removed/added/changed thread ids) and `danglingAgentTopics`, and the CLI prints them.
+
 ## [0.9.95-exgenius.6] - 2026-10-01
 
 Fork versioning: exGeni fork releases now carry the upstream base plus an `-exgenius.N` suffix (upstream `main` is 0.9.95). The fork's earlier 0.9.96–0.9.100 releases map to `-exgenius.1` (#126) to `.5` (per-agent skills); they are not renumbered in history.
