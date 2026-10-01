@@ -5,6 +5,18 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.9.95-exgenius.6] - 2026-10-01
+
+Fork versioning: exGeni fork releases now carry the upstream base plus an `-exgenius.N` suffix (upstream `main` is 0.9.95). The fork's earlier 0.9.96–0.9.100 releases map to `-exgenius.1` (#126) to `.5` (per-agent skills); they are not renumbered in history.
+
+### Changed
+
+- **Tier-aware per-agent tools on `agents.update`** (`PUT /api/agents/:id`, field `tools`, OpenClaw `agents.entries.<id>.tools`).
+  - Narrowing is write-tier: more `deny` entries, a smaller effective `alsoAllow`, an `allow` list inside the current one (or a new one naming only core tools/groups), a profile inside the current effective profile, `fs.workspaceOnly` turned on.
+  - Anything else is dangerous-tier (confirm code), including `tools: null`, removing deny entries, adding `alsoAllow`, a broader profile, and a new `allow` naming a plugin tool, `group:plugins` or `*` (that opts optional plugin tools in). The tier is computed against the config on disk with the same function the service writes with, and fails closed.
+- `tools` accepts per-agent `allow` (strict allowlist; refused with `alsoAllow` and when empty, since OpenClaw reads an empty allow as every tool) and `fs.workspaceOnly` (`true`/`false`/`null`, patched field by field). Both validate with OpenClaw 2026.9.5.
+- `profile`/`alsoAllow`/`deny` are replaced together; `allow` is kept when omitted unless the patch supplies `alsoAllow`, `allow: null` removes it. Per-agent tools keys AlphaClaw does not manage (`elevated`, `exec`, `byProvider`, ...) are now kept instead of dropped. Unknown keys, unknown profiles and non-object `tools` are refused (400).
+
 ## [0.9.100] - 2026-09-30
 
 ### Added
