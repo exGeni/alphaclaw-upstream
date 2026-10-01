@@ -777,7 +777,33 @@ describe("agents.update tools tier", () => {
     const strict = tierFor(withTools({ profile: "messaging", allow: ["message", "sessions_list"] }));
     expect(strict(req({ profile: "messaging", allow: ["message"] }))).toBe("write");
     expect(strict(req({ profile: "messaging", allow: ["message", "exec"] }))).toBe("dangerous");
-    expect(strict(req({ profile: "messaging" }))).toBe("dangerous");
+    expect(strict(req({ profile: "messaging" }))).toBe("write"); // omitted allow is kept
+    expect(strict(req({ profile: "messaging", allow: null }))).toBe("dangerous");
+    expect(strict(req({ profile: "messaging", alsoAllow: ["message"] }))).toBe("dangerous");
+  });
+
+  it("a new allow list is write only for core tools: a plugin tool, group:plugins or * may opt in an optional plugin tool (refuter)", () => {
+    const unset = tierFor(withTools(undefined));
+    expect(unset(req({ allow: ["read", "group:messaging"] }))).toBe("write");
+    expect(unset(req({ allow: ["optional_plugin_tool"] }))).toBe("dangerous");
+    expect(unset(req({ allow: ["group:plugins"] }))).toBe("dangerous");
+    expect(unset(req({ allow: ["*"] }))).toBe("dangerous");
+    expect(unset(req({ allow: ["read", "*"] }))).toBe("dangerous");
+    // Already granted through the effective alsoAllow: no new opt-in.
+    const granted = tierFor(withTools({ profile: "minimal", alsoAllow: ["optional_plugin_tool", "read"] }));
+    expect(granted(req({ profile: "minimal", allow: ["optional_plugin_tool"] }))).toBe("write");
+  });
+
+  it("a new allow list is write only for core tools: a plugin tool, group:plugins or * may opt in an optional plugin tool (refuter)", () => {
+    const unset = tierFor(withTools(undefined));
+    expect(unset(req({ allow: ["read", "group:messaging"] }))).toBe("write");
+    expect(unset(req({ allow: ["optional_plugin_tool"] }))).toBe("dangerous");
+    expect(unset(req({ allow: ["group:plugins"] }))).toBe("dangerous");
+    expect(unset(req({ allow: ["*"] }))).toBe("dangerous");
+    expect(unset(req({ allow: ["read", "*"] }))).toBe("dangerous");
+    // Already granted through the effective alsoAllow: no new opt-in.
+    const granted = tierFor(withTools({ profile: "minimal", alsoAllow: ["optional_plugin_tool", "read"] }));
+    expect(granted(req({ profile: "minimal", allow: ["optional_plugin_tool"] }))).toBe("write");
   });
 
   it("fs.workspaceOnly: turning it on is write; off or removing it is dangerous (agent value overrides the global)", () => {

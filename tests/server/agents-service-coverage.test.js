@@ -309,6 +309,28 @@ describe("server/agents/service coverage", () => {
         expect(savedTools(fsMock)).toEqual({ profile: "messaging", allow: ["message", "sessions_list"] });
       });
 
+      it("keeps an allow list the patch omits (Setup UI shape); allow: null or a new alsoAllow replaces it (refuter)", async () => {
+        const { fsMock, service } = buildToolsService({ profile: "messaging", allow: ["message"] });
+        await service.updateAgent("reception", { tools: { profile: "messaging", deny: ["exec"] } });
+        expect(savedTools(fsMock)).toEqual({ profile: "messaging", allow: ["message"], deny: ["exec"] });
+        await service.updateAgent("reception", { tools: { profile: "minimal", alsoAllow: ["read"] } });
+        expect(savedTools(fsMock)).toEqual({ profile: "minimal", alsoAllow: ["read"] });
+        await service.updateAgent("reception", { tools: { profile: "messaging", allow: ["message"] } });
+        await service.updateAgent("reception", { tools: { profile: "messaging", allow: null } });
+        expect(savedTools(fsMock)).toEqual({ profile: "messaging" });
+      });
+
+      it("keeps an allow list the patch omits (Setup UI shape); allow: null or a new alsoAllow replaces it (refuter)", async () => {
+        const { fsMock, service } = buildToolsService({ profile: "messaging", allow: ["message"] });
+        await service.updateAgent("reception", { tools: { profile: "messaging", deny: ["exec"] } });
+        expect(savedTools(fsMock)).toEqual({ profile: "messaging", allow: ["message"], deny: ["exec"] });
+        await service.updateAgent("reception", { tools: { profile: "minimal", alsoAllow: ["read"] } });
+        expect(savedTools(fsMock)).toEqual({ profile: "minimal", alsoAllow: ["read"] });
+        await service.updateAgent("reception", { tools: { profile: "messaging", allow: ["message"] } });
+        await service.updateAgent("reception", { tools: { profile: "messaging", allow: null } });
+        expect(savedTools(fsMock)).toEqual({ profile: "messaging" });
+      });
+
       it("patches fs.workspaceOnly field by field; fs: null removes it", async () => {
         const { fsMock, service } = buildToolsService({ profile: "messaging" });
         await service.updateAgent("reception", { tools: { profile: "messaging", fs: { workspaceOnly: true } } });
