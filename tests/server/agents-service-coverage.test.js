@@ -329,6 +329,20 @@ describe("server/agents/service coverage", () => {
         });
       });
 
+      it("names registry routes it could not restore after a failed config write (codex)", () => {
+        const registry = {
+          clearAgentReferences: vi.fn(() => [{ groupId: "-100", threadId: "16", agentId: "dispatcher" }]),
+          updateTopic: vi.fn(() => {
+            throw new Error("lock timeout");
+          }),
+        };
+        const { fsMock, service } = build(registry);
+        fsMock.writeFileSync.mockImplementation(() => {
+          throw new Error("disk full");
+        });
+        expect(() => service.deleteAgent("dispatcher")).toThrow("NOT restored (re-add with a topic PUT): -100/16->dispatcher");
+      });
+
       it("refuses the delete (openclaw.json untouched, retryable) when the registry clear fails", () => {
         const registry = {
           clearAgentReferences: vi.fn(() => {
