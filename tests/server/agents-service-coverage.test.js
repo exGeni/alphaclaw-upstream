@@ -240,7 +240,7 @@ describe("server/agents/service coverage", () => {
       expect(updated.identity).toEqual({ role: "helper", name: "Renamed" });
     });
 
-    it("clears tools config for non-object tools patches", async () => {
+    it("clears tools config with tools: null; {} keeps an empty tools object", async () => {
       const { fsMock, service } = buildService({
         initialConfig: {
           agents: {
@@ -259,6 +259,84 @@ describe("server/agents/service coverage", () => {
 
       const emptied = await service.updateAgent("tooly", { tools: {} });
       expect(emptied.tools).toEqual({});
+    });
+
+    describe("per-agent tools (profile / allow / alsoAllow / deny / fs)", () => {
+      const buildToolsService = (receptionTools) =>
+        buildService({
+          initialConfig: {
+            agents: {
+              list: [
+                { id: "main", default: true },
+                { id: "reception", ...(receptionTools ? { tools: receptionTools } : {}) },
+              ],
+            },
+          },
+        });
+      const savedTools = (fsMock) =>
+        fsMock.readConfig().agents.list.find((a) => a.id === "reception").tools;
+
+      it("keeps per-agent tools keys AlphaClaw does not manage, and fs when omitted", async () => {
+        const { fsMock, service } = buildToolsService({
+          profile: "coding",
+          deny: ["exec"],
+          elevated: { enabled: false },
+          exec: { security: "deny" },
+          fs: { workspaceOnly: true },
+        });
+        await service.updateAgent("reception", { tools: { profile: "messaging", deny: ["exec", "write"] } });
+        expect(savedTools(fsMock)).toEqual({
+          profile: "messaging",
+          deny: ["exec", "write"],
+          elevated: { enabled: false },
+          exec: { security: "deny" },
+          fs: { workspaceOnly: true },
+        });
+      });
+
+      it("sets a strict allow list and refuses allow together with alsoAllow, or an empty allow", async () => {
+        const { fsMock, service } = buildToolsService({ profile: "messaging" });
+        await service.updateAgent("reception", {
+          tools: { profile: "messaging", allow: [" message ", "message", "sessions_list"] },
+        });
+        expect(savedTools(fsMock)).toEqual({ profile: "messaging", allow: ["message", "sessions_list"] });
+        await expect(
+          service.updateAgent("reception", { tools: { allow: ["read"], alsoAllow: ["exec"] } }),
+        ).rejects.toThrow("cannot set both allow and alsoAllow");
+        await expect(service.updateAgent("reception", { tools: { allow: [] } })).rejects.toThrow(
+          "must name at least one tool",
+        );
+        expect(savedTools(fsMock)).toEqual({ profile: "messaging", allow: ["message", "sessions_list"] });
+      });
+
+      it("patches fs.workspaceOnly field by field; fs: null removes it", async () => {
+        const { fsMock, service } = buildToolsService({ profile: "messaging" });
+        await service.updateAgent("reception", { tools: { profile: "messaging", fs: { workspaceOnly: true } } });
+        expect(savedTools(fsMock).fs).toEqual({ workspaceOnly: true });
+        await service.updateAgent("reception", { tools: { profile: "messaging", fs: { workspaceOnly: null } } });
+        expect(savedTools(fsMock)).not.toHaveProperty("fs");
+        await service.updateAgent("reception", { tools: { profile: "messaging", fs: { workspaceOnly: false } } });
+        expect(savedTools(fsMock).fs).toEqual({ workspaceOnly: false });
+        await service.updateAgent("reception", { tools: { profile: "messaging", fs: null } });
+        expect(savedTools(fsMock)).not.toHaveProperty("fs");
+      });
+
+      it("rejects unknown keys, unknown profiles and non-object tools without writing", async () => {
+        const { fsMock, service } = buildToolsService({ profile: "messaging", deny: ["exec"] });
+        await expect(service.updateAgent("reception", { tools: { profile: "bogus" } })).rejects.toThrow(
+          "tools.profile must be one of",
+        );
+        await expect(service.updateAgent("reception", { tools: { elevated: {} } })).rejects.toThrow(
+          "unsupported keys: elevated",
+        );
+        await expect(service.updateAgent("reception", { tools: "none" })).rejects.toThrow(
+          "tools must be an object",
+        );
+        await expect(
+          service.updateAgent("reception", { tools: { fs: { workspaceOnly: "yes" } } }),
+        ).rejects.toThrow("workspaceOnly must be true, false or null");
+        expect(savedTools(fsMock)).toEqual({ profile: "messaging", deny: ["exec"] });
+      });
     });
 
     describe("per-agent models (agentRuntime / params / codeMode)", () => {
