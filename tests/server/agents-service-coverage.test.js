@@ -317,7 +317,8 @@ describe("server/agents/service coverage", () => {
         expect(savedTools(fsMock)).toEqual({ profile: "minimal", alsoAllow: ["read"] });
         await service.updateAgent("reception", { tools: { profile: "messaging", allow: ["message"] } });
         await service.updateAgent("reception", { tools: { profile: "messaging", alsoAllow: [] } });
-        expect(savedTools(fsMock)).toEqual({ profile: "messaging" }); // supplied [] replaces allow (codex)
+        // A supplied [] replaces allow and is kept as an own override of tools.alsoAllow (codex).
+        expect(savedTools(fsMock)).toEqual({ profile: "messaging", alsoAllow: [] });
         await service.updateAgent("reception", { tools: { profile: "messaging", allow: ["message"] } });
         await service.updateAgent("reception", { tools: { profile: "messaging", allow: null } });
         expect(savedTools(fsMock)).toEqual({ profile: "messaging" });

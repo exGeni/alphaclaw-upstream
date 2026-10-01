@@ -753,6 +753,7 @@ describe("agents.update tools tier", () => {
     expect(tier(req({ profile: "minimal", alsoAllow: ["read", "exec"] }))).toBe("dangerous");
     const globalWide = tierFor(withTools({ profile: "minimal", alsoAllow: ["read"] }, { alsoAllow: ["exec"] }));
     expect(globalWide(req({ profile: "minimal" }))).toBe("dangerous");
+    expect(globalWide(req({ profile: "minimal", alsoAllow: [] }))).toBe("write"); // own [] overrides the global
   });
 
   it("profile: unchanged or moving away from full is write; any other change is dangerous (plugins may declare tools per profile, codex)", () => {
