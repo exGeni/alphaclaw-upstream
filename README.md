@@ -219,13 +219,22 @@ echo '{"autoRepair":true}' | alphaclaw admin PUT /api/watchdog/settings --data-s
 alphaclaw admin DELETE /api/agents/legacy-bot --confirm ABCD-EFGH
 ```
 
-**MCP servers (`mcp.server-list`, `mcp.server-set`, `mcp.server-remove`).** The agent can read and edit OpenClaw's `mcp.servers.<name>` definitions in `openclaw.json` (OpenClaw hot-applies `mcp` changes; no gateway restart):
+**MCP servers (`mcp.server-list`, `mcp.server-set`, `mcp.server-remove`).** The agent can read and edit OpenClaw's `mcp.servers.<name>` definitions in `openclaw.json`. OpenClaw hot-applies `mcp` changes, so no gateway restart is needed.
 
-- `GET /api/mcp/servers` (safe) returns every entry with header and env values reduced to their shape: `${VAR}` reference names and fixed scheme text are shown, anything else becomes `<literal>` and the header is named in `literalHeaders`. URL userinfo and query values are `<redacted>`, `args` become a count, and unknown keys are listed by name only.
-- `PUT /api/mcp/servers/:name` creates or patches one entry field by field: `url`, `transport` (`streamable-http` or `sse`), `headers` (per header; `null` removes one), `toolFilter` `{include, exclude}` (per list; `null` removes it) and `requestTimeoutMs`. Keys the op does not manage, such as `codex`, are kept; any other body key is a 400. Every header value must be `${VAR}` env references around at most two words of fixed text, for example `Bearer ${GBRAIN_X_TOKEN}`; a literal value is refused with 400 `literal_secret` and never echoed, so store the secret with `env.update` first. Narrowing an existing server (a smaller `include`, a larger `exclude`, a timeout) is write-tier; a new server, a `url`/`headers`/`transport` change, or a widened or cleared filter needs a confirm code. An unknown name without `url` is a 404.
+- `GET /api/mcp/servers` (safe) returns every entry with header and env values reduced to their shape: `${VAR}` reference names and an allowlisted scheme word are shown, anything else becomes `<literal>`, and the header is named in `literalHeaders`. URL userinfo, query and `;matrix` values, fragments and credential-like path segments are `<redacted>` (in `url` and in `oauth.redirectUrl`/`clientMetadataUrl`). `command` becomes `{program, argCount}`, and unknown keys are listed by name only.
+- `PUT /api/mcp/servers/:name` creates or patches one entry field by field: `url`, `transport` (`streamable-http` or `sse`), `headers` (per header; `null` removes one), `toolFilter` `{include, exclude}` (per list; `null` removes it) and `requestTimeoutMs`.
+  - Keys the op does not manage, such as `codex`, are kept. Any other body key, an empty body, or a body that is not a JSON object is a 400. A body that changes nothing is not written (`changed: false`).
+  - A header value is exactly one `${VAR}`, optionally after one scheme word (`Bearer`, `Basic`, `Token`, `Bot`, `ApiKey`) and a space, for example `Bearer ${GBRAIN_X_AUTH_TOKEN}`. Anything else is refused with 400 `literal_secret` and never echoed.
+  - The variable must actually reach the gateway, or OpenClaw would send the unresolved text. Name it `*_AUTH_TOKEN` (forwarded by suffix) and store it with `env.update`, or have the operator add it to `ALPHACLAW_GATEWAY_ENV_PASSTHROUGH`. Otherwise the call gets 400 `env_not_forwarded`, naming the variable and the rule that withholds it.
+  - `OPENCLAW_*`, `ALPHACLAW_*`, the gateway and webhook tokens and `REMOTE_MCP_API_TOKEN` are refused with 400 `env_reserved`.
+  - A URL with userinfo, a fragment, a credential-like path segment, or a credential-like query or `;matrix` parameter with a literal value is refused.
+  - Tier: narrowing an existing server with exact tool names (a smaller `include`, a larger `exclude`, a timeout) is write-tier. A new server, a `url`/`headers`/`transport` change, a widened or cleared filter, or any `*` glob needs a confirm code, whose summary names the server, the URL host, the headers with their `${VAR}` names, the transport and the filter delta.
+  - An unknown name without `url` is a 404.
 - `DELETE /api/mcp/servers/:name` (dangerous) removes one entry; an unknown name is a 404.
 
-The `REMOTE_MCP_*` entry that AlphaClaw writes itself answers 409 `managed_by_env` to both writes.
+The `REMOTE_MCP_NAME` key (default `remote`) is reserved for the entry AlphaClaw writes itself: create, set and remove there answer 409 `managed_by_env`, even while `REMOTE_MCP_*` is unset.
+
+A dangerous op can supply `confirmSummary(params)` in its manifest descriptor. The returned line, secret-shape scrubbed and clamped, is appended to the op title in the confirm prompt.
 
 **Honest framing (same convention as team mode).** This is not a hard security boundary against the agent. Since v0.9.63 the gateway child no longer inherits AlphaClaw's secrets (`SETUP_PASSWORD` and the internal credentials are withheld by the allowlist in `lib/server/gateway-env-policy.js`), but the agent still runs as AlphaClaw's own uid with `HOME` under the data root, so an unsandboxed exec can read `.env` and the state dir from disk. Agent Administration exists to keep secrets out of chat transcripts, attribute actions for audit, enable revocation, and add tiered guardrails and structured errors.
 ## Team Access (beta)

@@ -10,11 +10,20 @@ Versions follow this repository's `package.json` release counter.
 ### Added
 
 - **Agent-admin MCP server ops** (domain `mcp`): `mcp.server-list` (`GET /api/mcp/servers`, safe), `mcp.server-set` (`PUT /api/mcp/servers/:name`) and `mcp.server-remove` (`DELETE /api/mcp/servers/:name`, dangerous) manage OpenClaw `mcp.servers.<name>` through the locked `updateOpenclawConfig` write path.
-  - Reads redact every header and env value to its shape (`${VAR}` names and fixed scheme text; anything else `<literal>`), strip URL userinfo and query values, and list unknown keys by name only. The redaction applies to dashboard and agent callers alike.
-  - `mcp.server-set` patches `url`, `transport`, `headers`, `toolFilter` `{include, exclude}` and `requestTimeoutMs` field by field and keeps keys it does not manage (`codex`, `enabled`, `auth`, ...). Unknown keys are a 400. A header value that is not `${VAR}` references around fixed scheme text is refused with 400 `literal_secret` and is not echoed in the response, the log or the audit row.
-  - Tier: narrowing an existing server (smaller include, larger exclude, timeout only) is write; a new server, a url/header/transport change, or a widened or cleared filter is dangerous. An unknown name without `url` is a 404, and the `REMOTE_MCP_*` managed entry answers 409 `managed_by_env`.
-  - `/api/mcp` joins the local-only API prefixes in `routes/proxy.js`, so its request bodies are parsed instead of being left for the gateway proxy.
+  - Reads redact header and env values to their shape (`${VAR}` names plus an allowlisted scheme word; anything else `<literal>`). URLs (also `oauth.redirectUrl`/`clientMetadataUrl`) lose userinfo, query and `;matrix` values, fragments and credential-like path segments. `command` becomes `{program, argCount}`, and unknown keys are listed by name only. The redaction applies to dashboard and agent callers alike.
+  - `mcp.server-set` patches `url`, `transport`, `headers`, `toolFilter` `{include, exclude}` and `requestTimeoutMs` field by field and keeps keys it does not manage (`codex`, `enabled`, `auth`, ...). Unknown keys, an empty body, or a body that is not a JSON object are a 400, and a no-op body skips the write.
+  - A header value must be `[Bearer|Basic|Token|Bot|ApiKey ]${VAR}`; anything else is refused with 400 `literal_secret` and is not echoed in the response, the log or the audit row. `VAR` must reach the gateway under `gateway-env-policy.js` (400 `env_not_forwarded` names the var and rule). `OPENCLAW_*`/`ALPHACLAW_*`, the gateway/webhook tokens and `REMOTE_MCP_API_TOKEN` are refused (400 `env_reserved`).
+  - URLs with userinfo, a fragment, a credential-like path segment, or a credential-like query/`;matrix` parameter with a literal value are refused.
+  - Tier: narrowing an existing server with exact names (smaller include, larger exclude, timeout only) is write. A new server, a url/header/transport change, a widened or cleared filter, or any `*` glob (Codex's MCP projection asserts exact names) is dangerous. An unknown name without `url` is a 404, and the `REMOTE_MCP_NAME` key (default `remote`) answers 409 `managed_by_env` even while `REMOTE_MCP_*` is unset.
+  - Confirm prompts for these ops say what changes: set shows the server name, URL host, header names with their `${VAR}` names, transport and filter delta; remove shows the name.
   - The agent-admin skill size budget test moves from 62k to 63k characters for the new domain.
+- **Per-op confirm detail:** a manifest descriptor may define `confirmSummary({method, path, pathParams, query, body})`. `confirm-service.js` appends its line to the op title (secret-shape scrubbed, control characters stripped, 400 characters max), and the serialized manifest marks such ops `detailedConfirm: true`. A throw or a non-string falls back to the title.
+
+### Changed
+
+- `gateway-env-policy.js` exports `classifyGatewayEnvKey(key)` → `{forwarded, rule}`; `filterGatewayChildEnv` now uses it per key, with the same decisions.
+- `REMOTE_MCP_NAME` resolution moved into `lib/server/remote-mcp-name.js`, shared by the gateway's managed-entry writer and the MCP ops.
+- `/api/mcp` joins the local-only API prefixes in `routes/proxy.js`, so its request bodies are parsed instead of being left for the gateway proxy.
 
 ## [0.9.99-exgenius.9] - 2026-10-04
 
