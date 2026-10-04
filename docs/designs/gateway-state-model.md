@@ -334,14 +334,53 @@ Step labels are human ("Checking plugins", "Stopping gateway", "Starting gateway
 > gateway's code and never respawns); once the gateway is proven ready and the
 > launcher is still alive one second later, it is ADOPTED as the managed child
 > (`attachManagedGatewayExitClassification`, `supervisor: true`, gateway pid
-> resolved from /proc as `workerPid` for the restart-handoff consume). Two shape
-> differences from a `gateway run` child: the graceful stop path
-> (`stopGatewayChildAndWait`) SIGTERMs the launcher and skips its SIGKILL
-> escalation (its own backstop re-SIGTERMs at 1s, SIGKILLs the gateway at 2s,
-> exits 1 at 3s; the shutdown last-ditch `killGatewayNow` reap goes through
-> `killManagedGatewayChildNow`, which returns false for an adopted launcher for
-> the same reason), and an EXPECTED exit with code 1 is booked as a
-> managed stop.
+> resolved from /proc as `workerPid` for the restart-handoff consume). The shape
+> difference from a `gateway run` child that remains is exit classification: an
+> EXPECTED exit with code 1 is booked as a managed stop (the launcher exits 1
+> when its own reap timer had to kill a gateway still draining). The stop
+> contract is the same for both shapes since the 2026-10-04 update below.
+>
+> **2026-10-04 update (OpenClaw 2026.9.8 drain model, refuter finding M2).**
+> Since 2026.9.6 the serving gateway (`openclaw-gateway`) owns drain and cleanup
+> on SIGTERM: it stops admitting work, drains for up to 315 s, keeps a 10 s
+> cleanup reserve, and releases state ownership only after that settles
+> (OpenClaw `docs/gateway/restart-recovery.md` "Graceful restarts drain first",
+> `docs/gateway/gateway-lock.md` "On shutdown, ..."). The launcher forwards
+> the signal and reaps its child only at the end of the 330 s service stop
+> budget (`gateway-shutdown-budget.mjs` `GATEWAY_SERVICE_STOP_TIMEOUT_MS`;
+> `node-runtime-recovery.mjs` re-SIGTERMs at 328 s, SIGKILLs at 329 s, exits 1
+> at 330 s), not after the 1/2/3 s backstop 2026.9.5 had. AlphaClaw now:
+> - **stop** (`stopGatewayChildAndWait`, both shapes): SIGTERM, then wait for
+>   the launcher AND its worker to exit for `kGatewayStopBudgetMs`
+>   (`ALPHACLAW_GATEWAY_STOP_TIMEOUT`, default 345 s = 330 + 15, clamped
+>   10–900); AlphaClaw's own shutdown uses `kGatewayShutdownStopBudgetMs`
+>   (`ALPHACLAW_GATEWAY_SHUTDOWN_STOP_TIMEOUT`, same default) inside a process
+>   deadline derived to outlive it (`kProcessShutdownDeadlineMs` = budget +
+>   10 s). SIGKILL only past the budget, worker FIRST — SIGKILL cannot be
+>   forwarded, so killing the launcher alone orphans the gateway on the port.
+>   `killManagedGatewayChildNow` (the last-ditch `killGatewayNow`) is
+>   worker-first too and no longer skips an adopted launcher.
+> - **cold restart** (`runGatewayColdStart` → `waitForGatewayReleased`): the
+>   replacement is spawned only after the old gateway's serving processes
+>   (managed child + worker, the owner of this state directory's projection and
+>   its launcher, the unambiguous serving identity — captured with /proc start
+>   ticks) have exited and none of them owns
+>   `$OPENCLAW_STATE_DIR/tmp/openclaw-<uid>/gateway.state.lock`; without /proc
+>   pid evidence, the port must be closed and the projection unheld. Past the
+>   budget (measured from the SIGTERM) AlphaClaw's own processes are SIGKILLed
+>   and the restart throws `GatewayIncumbentRestartError` with
+>   `phase: "stop_release"` (reason `incumbent_gateway_still_running`, so the
+>   watchdog's `awaitingAutoRepairRecovery` latch applies) — nothing is
+>   spawned. The old 15 s stop-settle followed by `gateway --force` raced a
+>   draining gateway: non-interactive `--force` refuses to kill a verified
+>   listener (`docs/cli/gateway/running.md`), and a new gateway waits up to five
+>   minutes for state ownership (`gateway-lock.md`). A state-owning serving
+>   gateway this AlphaClaw process did not spawn gets one SIGTERM, never a
+>   SIGKILL.
+> - **budgets**: `kGatewayRestartOperationBudgetMs` = ready wait + 240 s
+>   preflight + stop budget + 45 s (floored at the lease), so the lock, the
+>   operation record and the watchdog suppression windows cover the drain. The
+>   300 s ready wait covers only the replacement's boot.
 > An expected late exit of a pid that is no longer `state.gatewayPid` is recorded
 > `stalePredecessor: true` and never rewrites the live lifecycle. The right column
 > applies only when the launcher has already exited by ready (daemonizing builds).

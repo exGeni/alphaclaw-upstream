@@ -28,6 +28,17 @@ Versions follow this repository's `package.json` release counter.
 - `REMOTE_MCP_NAME` resolution moved into `lib/server/remote-mcp-name.js`, shared by the gateway's managed-entry writer and the MCP ops.
 - `/api/mcp` joins the local-only API prefixes in `routes/proxy.js`, so its request bodies are parsed instead of being left for the gateway proxy.
 
+
+### Fixed
+
+- **Gateway stop and cold restart follow OpenClaw 2026.9.8's drain model.** Since 2026.9.6 the serving gateway (`openclaw-gateway`) owns drain and cleanup on SIGTERM, and the `openclaw.mjs` launcher waits for it for the whole 330 s service stop budget (`gateway-shutdown-budget.mjs`; re-SIGTERM 328 s, SIGKILL 329 s, exit 1 at 330 s) instead of the 2 s backstop AlphaClaw assumed.
+  - `stopGatewayChildAndWait` SIGTERMs and waits for the launcher AND its `openclaw-gateway` worker to exit, for `ALPHACLAW_GATEWAY_STOP_TIMEOUT` (default 345 s = 330 + 15, clamped 10–900). Only past that budget does it SIGKILL, worker first: the launcher cannot forward SIGKILL, so killing only the launcher orphaned a draining gateway on the port. An adopted cold-restart launcher is no longer left alive after 2 s with a `false` result.
+  - `killManagedGatewayChildNow` (shutdown deadline, second signal) now reaps an adopted launcher too, worker first.
+  - The cold restart no longer spawns `gateway --force` 15 s after the stop. It waits, up to the same budget from the SIGTERM, until the old gateway's processes have exited, and until the port is closed and the state-ownership projection (`$OPENCLAW_STATE_DIR/tmp/openclaw-<uid>/gateway.state.lock`) is released. Past the budget it fails with `GatewayIncumbentRestartError` (`phase: "stop_release"`, reason `incumbent_gateway_still_running`) and starts nothing. `--force` in a non-interactive shell refuses to kill a verified listener, and a new gateway would wait up to five minutes for state ownership. A state-owning gateway that this AlphaClaw process did not spawn gets one SIGTERM. It is never SIGKILLed.
+  - AlphaClaw's own shutdown waits for the gateway's drain for `ALPHACLAW_GATEWAY_SHUTDOWN_STOP_TIMEOUT` (default 345 s). The process shutdown deadline and the self-update drain race are now that value + 10 s, so the 10 s deadline no longer hard-exits in the middle of a drain.
+  - `kGatewayRestartOperationBudgetMs` adds the stop budget (ready wait + 240 s preflight + stop budget + 45 s). The 300 s ready wait now covers only the replacement's boot.
+  - Both knobs are deployment-env only.
+
 ## [0.9.99-exgenius.9] - 2026-10-04
 
 exGeni fork line rebuilt on upstream **v0.9.99** (`garrytan/alphaclaw` main
