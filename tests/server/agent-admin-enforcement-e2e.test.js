@@ -156,6 +156,35 @@ describe("agent-admin composed enforcement (confirm flow + audit + redaction + h
     }
   });
 
+  // agents.update tools tier through the REAL /api mount.
+  it("agents.update tools: narrowing passes without a confirm, widening gets 428", async () => {
+    const openclawConfig = require("../../lib/server/openclaw-config");
+    const spy = vi.spyOn(openclawConfig, "readOpenclawConfig").mockReturnValue({
+      agents: { list: [{ id: "reception", tools: { profile: "messaging", deny: ["exec"] } }] },
+    });
+    try {
+      const { confirmService } = useRealConfirmService();
+      const { app } = createApp({ confirmService });
+
+      const narrow = await withBearer(
+        request(app)
+          .put("/api/agents/reception")
+          .send({ tools: { profile: "messaging", deny: ["exec", "write"], fs: { workspaceOnly: true } } }),
+      );
+      expect(narrow.status).toBe(200);
+
+      const widen = await withBearer(
+        request(app).put("/api/agents/reception").send({ tools: { profile: "messaging" } }),
+      );
+      expect(widen.status).toBe(428);
+
+      const cleared = await withBearer(request(app).put("/api/agents/reception").send({ tools: null }));
+      expect(cleared.status).toBe(428);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   // 1. The headline dangerous end-to-end path, driven entirely through the
   // middleware + confirm service + header (never unit-tested before).
   it("DANGEROUS end-to-end: 428 mints a code, same request + header passes, different path is confirm_invalid", async () => {
