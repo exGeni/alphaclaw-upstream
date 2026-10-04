@@ -361,6 +361,47 @@ describe("server/agents/service coverage", () => {
       });
     });
 
+    describe("per-agent skills allowlist", () => {
+      const buildSkillsService = (reception = {}) =>
+        buildService({
+          initialConfig: {
+            agents: {
+              defaults: { skills: ["github", "weather"] },
+              list: [{ id: "main", default: true }, { id: "reception", ...reception }],
+            },
+          },
+        });
+
+      it("sets an exact list, [] for none, and null to inherit the defaults", async () => {
+        const { fsMock, service } = buildSkillsService();
+        const read = () => fsMock.readConfig().agents.list.find((a) => a.id === "reception");
+
+        await service.updateAgent("reception", { skills: [" grant-intake ", "grant-intake", "faq"] });
+        expect(read().skills).toEqual(["grant-intake", "faq"]);
+
+        await service.updateAgent("reception", { skills: [] });
+        expect(read().skills).toEqual([]);
+
+        await service.updateAgent("reception", { skills: null });
+        expect(read()).not.toHaveProperty("skills");
+        expect(fsMock.readConfig().agents.defaults.skills).toEqual(["github", "weather"]);
+      });
+
+      it("rejects malformed skill lists without writing", async () => {
+        const { fsMock, service } = buildSkillsService({ skills: ["faq"] });
+        const before = JSON.stringify(fsMock.readConfig());
+        for (const [skills, message] of [
+          ["faq", "skills must be an array"],
+          [[1], "skills entries must be strings"],
+          [["two words"], "is not a skill name"],
+          [[""], "is not a skill name"],
+        ]) {
+          await expect(service.updateAgent("reception", { skills })).rejects.toThrow(message);
+        }
+        expect(JSON.stringify(fsMock.readConfig())).toBe(before);
+      });
+    });
+
     it("rejects invalid thinkingDefault values", async () => {
       const { service } = buildService();
       await expect(
