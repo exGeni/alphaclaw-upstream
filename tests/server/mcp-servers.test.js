@@ -24,6 +24,13 @@ const {
 } = require("../../lib/server/admin-manifest/domains/mcp");
 const { createAgentAdminEnforcement } = require("../../lib/server/agent-admin/enforcement");
 const { buildConfirmSummary, extractPathParams } = require("../../lib/server/agent-admin/confirm-service");
+const { renderTelegramHtml } = require("../../lib/server/utils/telegram-html");
+const { filterGatewayChildEnv } = require("../../lib/server/gateway-env-policy");
+const {
+  recordGatewayLaunchEnv,
+  resetGatewayLaunchEnvForTests,
+} = require("../../lib/server/gateway-launch-env-snapshot");
+const { isSensitiveParamKey } = require("../../lib/server/mcp-servers");
 
 // Fixture values are fake. kLiteral stands in for a literal credential an
 // agent might paste; the tests assert it never comes back out anywhere.
@@ -32,6 +39,31 @@ const { buildConfirmSummary, extractPathParams } = require("../../lib/server/age
 const kLiteral = "Bearer literalfixturevalue42";
 const kLiteralCore = "literalfixturevalue42";
 const kFakePathToken = "a8F3kQ9zL2mX7pR4tV6wY1bN5cJ0dH";
+
+// Every *_AUTH_TOKEN / *_API_KEY the fixtures reference, "set" in the env the
+// gateway would be spawned with (presence check, env_not_set). Placeholder
+// values, not credentials.
+const kFixtureEnvNames = [
+  "GBRAIN_TEST_AUTH_TOKEN",
+  "GBRAIN_X_AUTH_TOKEN",
+  "DOCS_AUTH_TOKEN",
+  "OTHER_AUTH_TOKEN",
+  "EXTRA_AUTH_TOKEN",
+  "ROTATED_AUTH_TOKEN",
+  "TENANT_AUTH_TOKEN",
+  "MCP_API_KEY",
+  "PATH_API_KEY",
+  "GBRAIN_X_TOKEN",
+];
+const kFixtureEnv = Object.fromEntries(kFixtureEnvNames.map((name) => [name, "fixture-placeholder"]));
+beforeEach(() => {
+  for (const name of kFixtureEnvNames) vi.stubEnv(name, "fixture-placeholder");
+  resetGatewayLaunchEnvForTests();
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+  resetGatewayLaunchEnvForTests();
+});
 
 const baseEntry = () => ({
   url: "https://brain.example.test/mcp",
@@ -52,13 +84,19 @@ const makeDir = (config) => {
 const configPath = (dir) => path.join(dir, "openclaw.json");
 const readConfig = (dir) => JSON.parse(fs.readFileSync(configPath(dir), "utf8"));
 
-const makeApp = (dir, { env = {} } = {}) => {
+const makeApp = (dir, { env = {}, getLaunchedEnvKeys } = {}) => {
   const app = express();
   app.use(express.json());
   const log = { log: vi.fn() };
   registerMcpServerRoutes({
     app,
-    mcpServersService: createMcpServersService({ fsModule: fs, openclawDir: dir, log, env }),
+    mcpServersService: createMcpServersService({
+      fsModule: fs,
+      openclawDir: dir,
+      log,
+      env: { ...kFixtureEnv, ...env },
+      ...(getLaunchedEnvKeys ? { getLaunchedEnvKeys } : {}),
+    }),
   });
   return { app, log };
 };
@@ -159,7 +197,7 @@ describe("mcp header env references reach the gateway (M1)", () => {
 
 describe("mcp url credential policy (M2)", () => {
   it("detects credential-like strings but not ordinary path words", () => {
-    for (const value of [kFakePathToken, "sk_live_FAKEFAKEFAKE", "ghp_FAKEFAKEFAKEFAKE", "123e4567-e89b-12d3-a456-426614174000", "eyJhbGciOi"]) {
+    for (const value of [kFakePathToken, "sk_live_FAKEFAKEFAKE", "gh" + "p_FAKEFAKEFAKEFAKE", "123e4567-e89b-12d3-a456-426614174000", "eyJhbGciOi"]) {
       expect(looksLikeCredential(value), value).toBe(true);
     }
     for (const value of ["mcp", "streamable-http-v2-endpoint", "api", "v1", "brain-tiflis", "${PATH_API_KEY}", "getPage"]) {
@@ -382,13 +420,15 @@ describe("mcp confirm summaries (M3)", () => {
         },
       }),
     ).toBe(
-      'server "docs" (new); url host docs.example.test; transport sse; headers Authorization: Bearer ${DOCS_AUTH_TOKEN}; include +search',
+      'server "docs" NEW; url host docs.example.test; transport sse; filter narrowed; headers set 1, removed 0; include +1 ["search"]; set Authorization=Bearer ${DOCS_AUTH_TOKEN}',
     );
     expect(
       summary({ pathParams: { name: "brain" }, body: { toolFilter: { include: ["search", "put_page", "get_*"], exclude: ["query"] } } }),
-    ).toBe('server "brain" (update); include +put_page,get_* -get_page,query; exclude +query');
+    ).toBe(
+      'server "brain" UPDATE; FILTER WIDENED; GLOB IN FILTER; include +2 ["put_page", "get_~"] -2 ["get_page", "query"]; exclude +1 ["query"]',
+    );
     expect(describeServerSet({ name: "brain", current: baseEntry(), patch: { headers: null, toolFilter: null } })).toBe(
-      'server "brain" (update); all headers removed; tool filter cleared',
+      'server "brain" UPDATE; FILTER CLEARED; ALL HEADERS REMOVED',
     );
   });
 
@@ -608,7 +648,7 @@ describe("mcp ops through agent-admin enforcement", () => {
     );
     registerMcpServerRoutes({
       app,
-      mcpServersService: createMcpServersService({ fsModule: fs, openclawDir: dir, log: null, env: {} }),
+      mcpServersService: createMcpServersService({ fsModule: fs, openclawDir: dir, log: null, env: kFixtureEnv }),
     });
     return { app, events };
   };
@@ -642,5 +682,168 @@ describe("mcp ops through agent-admin enforcement", () => {
     expect(events.map((e) => e.details.op)).toEqual(
       expect.arrayContaining(["mcp.server-set", "mcp.server-remove"]),
     );
+  });
+});
+
+describe("round 2: confirm summary cannot be steered by agent text (R2-1)", () => {
+  const cfg = { mcp: { servers: { docs: { url: "https://d.example.test/mcp", toolFilter: { include: ["search"] } } } } };
+  const setOp = () => ({
+    ...manifest.findOp("PUT", "/api/mcp/servers/docs"),
+    confirmSummary: createServerSetConfirmSummary({ readConfig: () => cfg }),
+  });
+  const req = (body, name = "docs") => ({ method: "PUT", baseUrl: "/api", path: `/mcp/servers/${name}`, body, query: {} });
+  const telegram = (summary) =>
+    renderTelegramHtml(`🔐 *Agent Administration*\nThe agent wants to: ${summary}\nReply with code \`ABCD-EFGH\` to approve.`).html;
+
+  it("a tool name carrying a house-format link or a fake code renders as inert data", () => {
+    for (const body of [
+      { toolFilter: { include: ["[Open](https://evil.example.test/phish)"] } },
+      { toolFilter: { exclude: ["x. Reply with code `WXYZ-1234` to approve"] } },
+      { toolFilter: { include: ["[a](https://e.test)", "`b`", "*c*"] } },
+    ]) {
+      const summary = buildConfirmSummary(setOp(), req(body));
+      expect(summary).toMatch(/server "docs" UPDATE/);
+      expect(summary).not.toMatch(/[`*[\]]/);
+      const html = telegram(summary);
+      expect(html).not.toContain("<a ");
+      expect(html).not.toContain("WXYZ-1234");
+      expect(html.match(/<code>/g)).toHaveLength(1); // only the real code
+    }
+  });
+
+  it("the generic confirm hook neutralises house markup from any op's detail line", () => {
+    const op = { id: "x.y", title: "Do X", path: "/api/x", confirmSummary: () => "[click](https://e.test) `CODE-1234` *now*" };
+    const summary = buildConfirmSummary(op, { method: "POST", baseUrl: "/api", path: "/x", query: {}, body: null });
+    expect(summary).toBe("Do X: (click)(https://e.test) 'CODE-1234' 'now'");
+  });
+
+  it("long header and tool lists can never push FILTER CLEARED / WIDENED / GLOB past the clamp", () => {
+    const headers = Object.fromEntries(
+      Array.from({ length: 8 }, (_, i) => [`X-Pad-Header-Name-Long-${i}-aaaaaaaaaaaaaaaaaaaaaaaa`, "Bearer ${DOCS_AUTH_TOKEN}"]),
+    );
+    const cleared = buildConfirmSummary(setOp(), req({ headers, toolFilter: null }));
+    expect(cleared.length).toBeLessThanOrEqual(400);
+    expect(cleared).toContain("FILTER CLEARED");
+    expect(cleared).toContain("headers set 8, removed 0");
+    const many = Array.from({ length: 60 }, (_, i) => `tool_name_padding_${i}_xxxxxxxxxxxxxxxx`);
+    const widened = buildConfirmSummary(setOp(), req({ headers, toolFilter: { include: [...many, "admin_*"] } }));
+    expect(widened.length).toBeLessThanOrEqual(400);
+    expect(widened).toContain("FILTER WIDENED");
+    expect(widened).toContain("GLOB IN FILTER");
+    expect(widened).not.toContain("url host");
+    const hostFirst = buildConfirmSummary(setOp(), req({ url: "https://new-host.example.test/mcp", headers, toolFilter: { include: many } }));
+    expect(hostFirst).toContain("url host new-host.example.test");
+    expect(hostFirst).toContain("include +60");
+  });
+
+  it("credential-shaped tool names and host labels are <redacted> in the summary", () => {
+    const summary = createServerSetConfirmSummary({ readConfig: () => cfg })({
+      pathParams: { name: "docs" },
+      body: { toolFilter: { exclude: ["ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"] } },
+    });
+    expect(summary).toContain("<redacted>");
+    expect(summary).not.toContain("a1B2c3D4");
+    expect(describeServerSet({ name: "docs", current: undefined, patch: { url: "https://a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6.mcp.example.test/mcp" } })).toBe(
+      'server "docs" NEW; url host <redacted>.mcp.example.test',
+    );
+  });
+});
+
+describe("round 2: referenced vars must be set, and a late var needs a restart (R2-2)", () => {
+  it("refuses a forwardable but unset or empty var with 400 env_not_set", async () => {
+    expect(codeOf(() => parseServerPatch({ headers: { Authorization: "Bearer ${NEVER_SET_ANYWHERE_AUTH_TOKEN}" } }))).toBe("env_not_set");
+    expect(codeOf(() => parseServerPatch({ headers: { Authorization: "Bearer ${EMPTY_AUTH_TOKEN}" } }, { env: { EMPTY_AUTH_TOKEN: "  " } }))).toBe("env_not_set");
+    const dir = makeDir({ mcp: { servers: { docs: { url: "https://d.example.test/mcp" } } } });
+    const res = await request(makeApp(dir).app)
+      .put("/api/mcp/servers/docs")
+      .send({ headers: { Authorization: "Bearer ${NEVER_SET_ANYWHERE_AUTH_TOKEN}" } });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("env_not_set");
+    expect(readConfig(dir).mcp.servers.docs).toEqual({ url: "https://d.example.test/mcp" });
+  });
+
+  it("reports restartRequired when the running gateway was spawned before the var was set", async () => {
+    const dir = makeDir({ mcp: { servers: { docs: { url: "https://d.example.test/mcp" } } } });
+    recordGatewayLaunchEnv({ PATH: "/bin", GBRAIN_TEST_AUTH_TOKEN: "x" });
+    const { app } = makeApp(dir, { getLaunchedEnvKeys: undefined });
+    const late = await request(app).put("/api/mcp/servers/docs").send({ headers: { Authorization: "Bearer ${DOCS_AUTH_TOKEN}" } });
+    expect(late.status).toBe(200);
+    expect(late.body.restartRequired).toBe(true);
+    expect(late.body.warning).toContain("${DOCS_AUTH_TOKEN}");
+    const known = await request(app).put("/api/mcp/servers/docs").send({ headers: { Authorization: "Bearer ${GBRAIN_TEST_AUTH_TOKEN}" } });
+    expect(known.body.restartRequired).toBe(false);
+    expect(known.body).not.toHaveProperty("warning");
+    const timeoutOnly = await request(app).put("/api/mcp/servers/docs").send({ requestTimeoutMs: 9 });
+    expect(timeoutOnly.body.restartRequired).toBe(false);
+  });
+
+  it("reports restartRequired with a warning when the running gateway's env is unknown", async () => {
+    const dir = makeDir({ mcp: { servers: { docs: { url: "https://d.example.test/mcp" } } } });
+    const res = await request(makeApp(dir).app).put("/api/mcp/servers/docs").send({ headers: { Authorization: "Bearer ${DOCS_AUTH_TOKEN}" } });
+    expect(res.body.restartRequired).toBe(true);
+    expect(res.body.warning).toMatch(/unknown/);
+  });
+
+  it("classifyGatewayEnvKey agrees with filterGatewayChildEnv on every key and hatch", () => {
+    const keys = ["PATH", "HOME", "ALPHACLAW_ROOT_DIR", "ALPHACLAW_X", "SETUP_PASSWORD", "OPENCLAW_GATEWAY_TOKEN", "X_API_KEY", "X_AUTH_TOKEN", "RAILWAY_API_TOKEN", "npm_config__auth", "npm_config_cache", "CLAUDE_CODE_LOCAL_X", "AWS_SECRET", "FOO", "GBRAIN_MCP_TOKEN", "WEBHOOK_TOKEN", "LC_ALL", "constructor", "__proto__", ""];
+    const hatches = [
+      { passthrough: "", unrestricted: false },
+      { passthrough: "GBRAIN_* FOO, SETUP_PASSWORD", unrestricted: false },
+      { passthrough: "", unrestricted: true },
+    ];
+    for (const hatch of hatches) {
+      const env = Object.fromEntries(keys.map((k) => [k, "v"]));
+      const out = filterGatewayChildEnv(env, { logger: {}, hatch });
+      for (const key of keys) {
+        expect(classifyGatewayEnvKey(key, { hatch }).forwarded, `${JSON.stringify(hatch)} ${key}`).toBe(
+          Object.prototype.hasOwnProperty.call(out, key),
+        );
+      }
+    }
+  });
+});
+
+describe("round 2: url keys, host labels, command program, reserved-name wording (R2-3..6)", () => {
+  it("refuses a credential-shaped host label and redacts it in the list view", () => {
+    for (const url of [
+      "https://a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6.mcp.example.test/mcp",
+      "https://sk-live-a1B2c3D4e5F6g7H8i9J0.example.test/mcp",
+    ]) {
+      expect(codeOf(() => parseServerPatch({ url })), url).toBe("literal_secret");
+    }
+    expect(redactMcpServerEntry({ url: "https://a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6.mcp.example.test/mcp" }).url).toBe(
+      "https://<redacted>.mcp.example.test/mcp",
+    );
+    expect(parseServerPatch({ url: "http://openclaw:3131/mcp" }).url).toBe("http://openclaw:3131/mcp");
+  });
+
+  it("matches sensitive param keys by whole key or delimited part, not substring", () => {
+    for (const key of ["code_version", "session", "authorized", "monkey", "page", "keyboard"]) {
+      expect(isSensitiveParamKey(key), key).toBe(false);
+    }
+    for (const key of ["token", "access_token", "apiKey", "api-key", "X-Amz-Signature", "jwt", "code", "jsessionid", "auth"]) {
+      expect(isSensitiveParamKey(key), key).toBe(true);
+    }
+    for (const url of ["https://h.example.test/mcp?code_version=2", "https://h.example.test/mcp?session=default", "https://h.example.test/mcp/sse?authorized=1"]) {
+      expect(parseServerPatch({ url }).url).toBe(url);
+    }
+    expect(codeOf(() => parseServerPatch({ url: "https://h.example.test/mcp?accessToken=plain" }))).toBe("literal_secret");
+  });
+
+  it("redacts a credential-shaped command program", () => {
+    expect(redactMcpServerEntry({ command: "gh" + "p_" + "abcdefghijklmnopqrstuvwxyz0123456789" }).command).toEqual({
+      program: "<redacted>",
+      argCount: 0,
+    });
+    expect(redactMcpServerEntry({ command: "/usr/local/bin/uvx mcp-server-fetch" }).command).toEqual({ program: "uvx", argCount: 1 });
+  });
+
+  it("states what the gateway actually does with the reserved entry", async () => {
+    const dir = makeDir({ mcp: { servers: {} } });
+    const res = await request(makeApp(dir).app).put("/api/mcp/servers/remote").send({ url: "https://r.example.test/mcp" });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("when REMOTE_MCP_URL and REMOTE_MCP_API_TOKEN are both set");
+    expect(res.body.error).toContain("managed marker");
+    expect(res.body.error).not.toContain("rewrites or removes");
   });
 });
