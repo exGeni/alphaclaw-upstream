@@ -219,6 +219,14 @@ echo '{"autoRepair":true}' | alphaclaw admin PUT /api/watchdog/settings --data-s
 alphaclaw admin DELETE /api/agents/legacy-bot --confirm ABCD-EFGH
 ```
 
+**MCP servers (`mcp.server-list`, `mcp.server-set`, `mcp.server-remove`).** The agent can read and edit OpenClaw's `mcp.servers.<name>` definitions in `openclaw.json` (OpenClaw hot-applies `mcp` changes; no gateway restart):
+
+- `GET /api/mcp/servers` (safe) returns every entry with header and env values reduced to their shape: `${VAR}` reference names and fixed scheme text are shown, anything else becomes `<literal>` and the header is named in `literalHeaders`. URL userinfo and query values are `<redacted>`, `args` become a count, and unknown keys are listed by name only.
+- `PUT /api/mcp/servers/:name` creates or patches one entry field by field: `url`, `transport` (`streamable-http` or `sse`), `headers` (per header; `null` removes one), `toolFilter` `{include, exclude}` (per list; `null` removes it) and `requestTimeoutMs`. Keys the op does not manage, such as `codex`, are kept; any other body key is a 400. Every header value must be `${VAR}` env references around at most two words of fixed text, for example `Bearer ${GBRAIN_X_TOKEN}`; a literal value is refused with 400 `literal_secret` and never echoed, so store the secret with `env.update` first. Narrowing an existing server (a smaller `include`, a larger `exclude`, a timeout) is write-tier; a new server, a `url`/`headers`/`transport` change, or a widened or cleared filter needs a confirm code. An unknown name without `url` is a 404.
+- `DELETE /api/mcp/servers/:name` (dangerous) removes one entry; an unknown name is a 404.
+
+The `REMOTE_MCP_*` entry that AlphaClaw writes itself answers 409 `managed_by_env` to both writes.
+
 **Honest framing (same convention as team mode).** This is not a hard security boundary against the agent. Since v0.9.63 the gateway child no longer inherits AlphaClaw's secrets (`SETUP_PASSWORD` and the internal credentials are withheld by the allowlist in `lib/server/gateway-env-policy.js`), but the agent still runs as AlphaClaw's own uid with `HOME` under the data root, so an unsandboxed exec can read `.env` and the state dir from disk. Agent Administration exists to keep secrets out of chat transcripts, attribute actions for audit, enable revocation, and add tiered guardrails and structured errors.
 ## Team Access (beta)
 

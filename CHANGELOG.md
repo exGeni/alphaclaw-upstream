@@ -5,6 +5,17 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [Unreleased]
+
+### Added
+
+- **Agent-admin MCP server ops** (domain `mcp`): `mcp.server-list` (`GET /api/mcp/servers`, safe), `mcp.server-set` (`PUT /api/mcp/servers/:name`) and `mcp.server-remove` (`DELETE /api/mcp/servers/:name`, dangerous) manage OpenClaw `mcp.servers.<name>` through the locked `updateOpenclawConfig` write path.
+  - Reads redact every header and env value to its shape (`${VAR}` names and fixed scheme text; anything else `<literal>`), strip URL userinfo and query values, and list unknown keys by name only. The redaction applies to dashboard and agent callers alike.
+  - `mcp.server-set` patches `url`, `transport`, `headers`, `toolFilter` `{include, exclude}` and `requestTimeoutMs` field by field and keeps keys it does not manage (`codex`, `enabled`, `auth`, ...). Unknown keys are a 400. A header value that is not `${VAR}` references around fixed scheme text is refused with 400 `literal_secret` and is not echoed in the response, the log or the audit row.
+  - Tier: narrowing an existing server (smaller include, larger exclude, timeout only) is write; a new server, a url/header/transport change, or a widened or cleared filter is dangerous. An unknown name without `url` is a 404, and the `REMOTE_MCP_*` managed entry answers 409 `managed_by_env`.
+  - `/api/mcp` joins the local-only API prefixes in `routes/proxy.js`, so its request bodies are parsed instead of being left for the gateway proxy.
+  - The agent-admin skill size budget test moves from 62k to 63k characters for the new domain.
+
 ## [0.9.99-exgenius.9] - 2026-10-04
 
 exGeni fork line rebuilt on upstream **v0.9.99** (`garrytan/alphaclaw` main
