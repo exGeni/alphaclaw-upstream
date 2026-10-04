@@ -184,16 +184,20 @@ const createFakeGateway = ({
         );
         return;
       }
-      // A real `openclaw gateway stop` releases the port; the restart
-      // pipeline now waits for that release before launching.
+      // A real `openclaw gateway stop` releases the port and the stopped
+      // gateway's processes exit; the restart pipeline waits for that release
+      // (port closed, pre-stop serving pids gone — OpenClaw 2026.9.6+ drain
+      // model) before launching.
       if (fake.holdStop) {
         fake.releaseStop = () => {
           fake.portOpen = false;
+          fake.livePids = [];
           cb(null, "", "");
         };
         return;
       }
       fake.portOpen = false;
+      fake.livePids = [];
       cb(null, "", "");
       return;
     }
@@ -691,7 +695,8 @@ describe("server/gateway restart drills (e2e)", () => {
     const app = createApp(harness.deps);
     const sseHandler = captureOperationsSseHandler(harness.operationEvents);
 
-    // Fake timers step the 15s stop-settle window.
+    // Fake timers step the stop budget (345s default: OpenClaw 2026.9.8's 330s
+    // service stop budget + 15s) the surviving incumbent burns.
     vi.useFakeTimers();
     let client = null;
     try {
@@ -700,7 +705,7 @@ describe("server/gateway restart drills (e2e)", () => {
       const { operationId } = res.body;
       client = openSseClient(sseHandler, operationId);
 
-      for (let i = 0; i < 20; i += 1) {
+      for (let i = 0; i < 80; i += 1) {
         if (
           harness.operationEvents.getOperation(operationId)?.status ===
           "failed"
@@ -719,10 +724,9 @@ describe("server/gateway restart drills (e2e)", () => {
         ["step", "Checking plugins", "running"],
         ["step", "Checking plugins", "skipped"],
         ["step", "Stopping gateway", "running"],
+        // The incumbent never released the port: the restart fails at the
+        // stop budget and NO replacement is started (no `--force` race).
         ["step", "Stopping gateway", "warning"],
-        ["step", "Starting gateway", "running"],
-        ["step", "Waiting for health check", "running"],
-        ["step", "Waiting for health check", "warning"],
         ["step", "Ready", "warning"],
       ]);
       const stoppingWarning = events.find(
@@ -746,11 +750,9 @@ describe("server/gateway restart drills (e2e)", () => {
       expect(events.some((e) => e.event === "done")).toBe(false);
 
       // The stop went out WITHOUT --force (the probe said the pin lacks it),
-      // and --force's supervisor still ran.
+      // and no replacement supervisor was spawned against the incumbent.
       expect(fake.stopCalls).toEqual([["gateway", "stop"]]);
-      expect(fake.spawnCalls.map((call) => call.args)).toEqual([
-        ["gateway", "--force"],
-      ]);
+      expect(fake.spawnCalls.map((call) => call.args)).toEqual([]);
 
       const status = await request(app).get("/api/restart-status");
       expect(status.status).toBe(200);
@@ -799,10 +801,11 @@ describe("server/gateway restart drills (e2e)", () => {
             cliRefused: true,
             cliExitCode: 1,
             preStopPids: [31337],
-            postReadyPids: [31337],
-            newPids: [],
             survivingPids: [31337],
-            supervisorPid: 4242,
+            // Failed in the stop phase: nothing was spawned, so there is no
+            // supervisor pid and no post-ready snapshot.
+            phase: "stop_release",
+            portOpen: true,
           }),
         },
       });
@@ -1325,7 +1328,8 @@ describe("server/gateway restart drills (e2e)", () => {
       const incumbent = { healthy: true };
       const { watchdog, insertWatchdogEvent, clawCmd, notifier, coldRestartHolds } =
         createDrillWatchdog({ fake, harness, isHealthy: () => incumbent.healthy });
-      // Fake timers step the 15s stop-settle window the refused stop burns.
+      // Fake timers step the stop budget (345s default) the surviving
+      // incumbent burns before the restart fails without a spawn.
       vi.useFakeTimers();
       try {
         await bootAroundIncumbent(fake);
@@ -1339,7 +1343,7 @@ describe("server/gateway restart drills (e2e)", () => {
         await wedgeIncumbentToTheGate({ incumbent, watchdog, insertWatchdogEvent, clawCmd, fake });
 
         const third = watchdog.runHealthCheck({ source: "health_timer" });
-        for (let i = 0; i < 40; i += 1) {
+        for (let i = 0; i < 400; i += 1) {
           if (restartRows(insertWatchdogEvent, { source: "repair", status: "failed" }).length) {
             break;
           }
@@ -1353,7 +1357,8 @@ describe("server/gateway restart drills (e2e)", () => {
           expect.objectContaining({ skipped: true, pid: kIncumbentPid }),
         ]);
         expect(fake.stopCalls).toEqual([["gateway", "stop"]]);
-        expect(fake.spawnCalls.map((call) => call.args)).toEqual([["gateway", "--force"]]);
+        // No replacement is spawned while the incumbent holds the port.
+        expect(fake.spawnCalls.map((call) => call.args)).toEqual([]);
         expect(coldRestartHolds).toEqual(["repair"]);
 
         const repairRows = restartRows(insertWatchdogEvent, { source: "repair" });

@@ -107,6 +107,20 @@ describe("gateway reap e2e (real child processes via PATH-shimmed openclaw)", ()
     return shimPath;
   };
 
+  // Scope the real /proc scan to this fixture's argv while retaining the
+  // real scan, ancestry and start-tick reads: a user's gateway (or the live
+  // stack) may share the host and must never enter a fixture's evidence.
+  const scopeProcessScanToCase = () => {
+    const scanProcesses = lockContention.listLiveOpenclawProcesses;
+    vi.spyOn(lockContention, "listLiveOpenclawProcesses").mockImplementation((options = {}) =>
+      scanProcesses({
+        ...options,
+        match: (argv) => argv.some((arg) => arg.startsWith(`${caseDir}${path.sep}`)) &&
+          (!options.match || options.match(argv)),
+      }),
+    );
+  };
+
   beforeEach(() => {
     originalPath = process.env.PATH;
     trackedPids = [];
@@ -186,7 +200,8 @@ describe("gateway reap e2e (real child processes via PATH-shimmed openclaw)", ()
     expect(isPidAlive(child.pid)).toBe(true);
 
     const startedAt = Date.now();
-    const stopped = await gateway.stopGatewayChildAndWait({ graceMs: 300 });
+    // budgetMs stands in for the 345s production stop budget.
+    const stopped = await gateway.stopGatewayChildAndWait({ budgetMs: 300 });
     const elapsedMs = Date.now() - startedAt;
 
     // child.kill("SIGTERM") set `.killed` on SEND; the pre-fix guard would
@@ -202,7 +217,7 @@ describe("gateway reap e2e (real child processes via PATH-shimmed openclaw)", ()
     });
     expect(child.signalCode).toBe("SIGKILL");
     expect(stopped).toBe(true);
-    // SIGTERM alone cannot have done it: the grace window had to elapse
+    // SIGTERM alone cannot have done it: the stop budget had to elapse
     // first (the helper ignores SIGTERM), and the whole stop stays bounded.
     expect(elapsedMs).toBeGreaterThanOrEqual(250);
     expect(elapsedMs).toBeLessThan(5000);
@@ -257,6 +272,10 @@ describe("gateway reap e2e (real child processes via PATH-shimmed openclaw)", ()
     // the 3s unref'd killTimer's SIGKILL can reap it. `gateway stop` (issued
     // by runGatewayColdStart before the spawn and by the best-effort
     // shutdown exec after) exits 0 immediately.
+    // The cold restart's release wait scans /proc for the OLD gateway's
+    // serving processes; scope it to this fixture so a real gateway sharing
+    // the host is never taken for the incumbent.
+    scopeProcessScanToCase();
     const pidFile = path.join(caseDir, "supervisor.pid");
     installOpenclawShim(
       [
@@ -313,14 +332,7 @@ describe("gateway reap e2e (real child processes via PATH-shimmed openclaw)", ()
     // /proc scan, ancestry and start-tick reads. A user's gateway or the live
     // memory suite may share the host: production correctly refuses their
     // multiple roots, but they are not part of this isolated tree fixture.
-    const scanProcesses = lockContention.listLiveOpenclawProcesses;
-    vi.spyOn(lockContention, "listLiveOpenclawProcesses").mockImplementation((options = {}) =>
-      scanProcesses({
-        ...options,
-        match: (argv) => argv.some((arg) => arg.startsWith(`${caseDir}${path.sep}`)) &&
-          (!options.match || options.match(argv)),
-      }),
-    );
+    scopeProcessScanToCase();
     // The fake `gateway run` mirrors the real launcher shape: the shim (sh,
     // argv "…/bin/openclaw gateway run" — a serving-pattern root) stays alive
     // as the process-tree root and forwards TERM to its worker, a second
@@ -404,5 +416,231 @@ describe("gateway reap e2e (real child processes via PATH-shimmed openclaw)", ()
     });
     expect(second.identity.startTicks).toBeGreaterThan(first.identity.startTicks);
     expect(gateway.getLaunchGeneration()).toBe(2);
+  });
+
+  // ── OpenClaw 2026.9.6+ drain model (refuter finding M2) ─────────────────
+  // A fake launcher that behaves like 2026.9.8's `runRespawnedChild`: it
+  // forwards SIGTERM to its worker (named `openclaw`, like the serving
+  // gateway) and keeps waiting until the worker exits, then exits with the
+  // worker's code. The worker "drains" for DRAIN seconds after SIGTERM
+  // (DRAIN=never: it ignores SIGTERM) and, when LISTEN=1, holds the gateway
+  // port through a node listener until it exits.
+  const readGatewayPort = () =>
+    JSON.parse(fs.readFileSync(path.join(OPENCLAW_DIR, "openclaw.json"), "utf8")).gateway.port;
+
+  const stateLockPath = path.join(
+    OPENCLAW_DIR,
+    "tmp",
+    typeof process.getuid === "function" ? `openclaw-${process.getuid()}` : "openclaw",
+    "gateway.state.lock",
+  );
+
+  const installDrainingGateway = ({
+    runDrain = "1",
+    runListen = false,
+    runHoldsState = false,
+    forceDrain = "1",
+    forceListen = true,
+  } = {}) => {
+    const port = readGatewayPort();
+    fs.rmSync(stateLockPath, { force: true });
+    const listenerPath = path.join(caseDir, "listen.js");
+    fs.writeFileSync(
+      listenerPath,
+      [
+        'const server = require("net").createServer((s) => s.destroy());',
+        `server.listen(${port}, "127.0.0.1");`,
+        'process.on("SIGTERM", () => server.close(() => process.exit(0)));',
+      ].join("\n"),
+    );
+    const workerDir = path.join(caseDir, "worker");
+    fs.mkdirSync(workerDir, { recursive: true });
+    const workerScript = path.join(workerDir, "openclaw");
+    fs.writeFileSync(
+      workerScript,
+      [
+        "#!/bin/sh",
+        // $3 = tag (run|force), $4 = drain seconds or "never", $5 = listen
+        // 0|1, $6 = publish the state-ownership projection 0|1
+        `echo $$ > ${JSON.stringify(caseDir)}/worker-$3.pid`,
+        "listener=",
+        `if [ "$5" = "1" ]; then ${JSON.stringify(process.execPath)} ${JSON.stringify(listenerPath)} & listener=$!; echo $listener > ${JSON.stringify(caseDir)}/listener-$3.pid; fi`,
+        'if [ "$4" = "never" ]; then',
+        "  trap '' TERM",
+        "  while :; do sleep 1; done",
+        "fi",
+        // Upstream's state-ownership projection (docs/gateway/gateway-lock.md):
+        // published at start, removed only AFTER the drain settles, while the
+        // listener closes at once — exactly the order 2026.9.8 documents.
+        `lockfile=${JSON.stringify(stateLockPath)}`,
+        'if [ "$6" = "1" ]; then mkdir -p "$(dirname "$lockfile")"; printf \'{"pid":%s}\' $$ > "$lockfile"; fi',
+        "sleep 60 & sleeper=$!",
+        `trap '[ -n "$listener" ] && kill $listener 2>/dev/null; sleep "$4"; [ "$6" = "1" ] && rm -f "$lockfile"; kill $sleeper 2>/dev/null; date +%s%N > ${JSON.stringify(caseDir)}/worker-$3.exited; exit 0' TERM`,
+        "wait $sleeper",
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    installOpenclawShim(
+      [
+        "#!/bin/sh",
+        'if [ "$1" = "gateway" ] && { [ "$2" = "run" ] || [ "$2" = "--force" ]; }; then',
+        '  if [ "$2" = "run" ]; then tag=run; drain=' + JSON.stringify(runDrain) + "; listen=" + (runListen ? "1" : "0") + "; else tag=force; drain=" + JSON.stringify(forceDrain) + "; listen=" + (forceListen ? "1" : "0") + "; fi",
+        `  date +%s%N > ${JSON.stringify(caseDir)}/launch-$tag.at`,
+        '  if [ "$tag" = "run" ]; then state=' + (runHoldsState ? "1" : "0") + "; else state=0; fi",
+        `  ${JSON.stringify(workerScript)} gateway run "$tag" "$drain" "$listen" "$state" &`,
+        "  worker=$!",
+        "  trap 'kill -TERM $worker 2>/dev/null' TERM INT",
+        "  wait $worker; rc=$?",
+        "  while kill -0 $worker 2>/dev/null; do wait $worker; rc=$?; done",
+        "  exit $rc",
+        "fi",
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    return { port };
+  };
+
+  const readNs = (file) => {
+    try {
+      return BigInt(fs.readFileSync(file, "utf8").trim());
+    } catch {
+      return null;
+    }
+  };
+
+  it("non-adopted `gateway run` launcher: SIGTERM, then drain, then exit — no SIGKILL inside the budget, worker waited on", async () => {
+    if (process.platform !== "linux") return;
+    scopeProcessScanToCase();
+    // 2.5s: longer than 9.5's 2s SIGKILL backstop the stop used to assume.
+    installDrainingGateway({ runDrain: "2.5" });
+    gateway = loadGateway();
+    const child = await gateway.launchGatewayProcess();
+    trackPid(child.pid);
+    await pollUntil(() => readPid(path.join(caseDir, "worker-run.pid")) !== null, { label: "worker pidfile" });
+    const workerPid = trackPid(readPid(path.join(caseDir, "worker-run.pid")));
+    expect(gateway.isManagedGatewayChildSupervisor()).toBe(false);
+
+    const startedAt = Date.now();
+    const stopped = await gateway.stopGatewayChildAndWait({ budgetMs: 10_000 });
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(stopped).toBe(true);
+    // The drain ran to completion (9.5's 2s SIGKILL would have cut it, and
+    // the launcher alone exiting is not enough — the worker is waited on).
+    expect(elapsedMs).toBeGreaterThanOrEqual(2400);
+    expect(elapsedMs).toBeLessThan(8000);
+    expect(fs.existsSync(path.join(caseDir, "worker-run.exited"))).toBe(true);
+    expect(isPidAlive(workerPid)).toBe(false);
+    await pollUntil(() => child.exitCode !== null || child.signalCode !== null, { label: "launcher exit event" });
+    expect(child.signalCode).toBeNull();
+    expect(child.exitCode).toBe(0);
+  });
+
+  it("non-adopted launcher: a drain longer than the budget is SIGKILLed after it — worker first, nothing orphaned", async () => {
+    if (process.platform !== "linux") return;
+    scopeProcessScanToCase();
+    installDrainingGateway({ runDrain: "never" });
+    gateway = loadGateway();
+    const child = await gateway.launchGatewayProcess();
+    trackPid(child.pid);
+    await pollUntil(() => readPid(path.join(caseDir, "worker-run.pid")) !== null, { label: "worker pidfile" });
+    const workerPid = trackPid(readPid(path.join(caseDir, "worker-run.pid")));
+
+    const startedAt = Date.now();
+    const stopped = await gateway.stopGatewayChildAndWait({ budgetMs: 1_000 });
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(stopped).toBe(true);
+    expect(elapsedMs).toBeGreaterThanOrEqual(950);
+    expect(elapsedMs).toBeLessThan(8000);
+    // The worker that ignored SIGTERM is dead too: killing only the launcher
+    // (the pre-fix behaviour) would have left it orphaned and alive.
+    expect(isPidAlive(workerPid)).toBe(false);
+    await pollUntil(() => child.exitCode !== null || child.signalCode !== null, { label: "launcher exit event" });
+    // The launcher either died BY our SIGKILL or exited on its own the moment
+    // its worker was SIGKILLed first (the worker-first order).
+    expect(child.signalCode === "SIGKILL" || child.exitCode !== null).toBe(true);
+  });
+
+  it("adopted cold-restart launcher (issue #56): SIGTERM, drain, exit — no SIGKILL inside the budget", async () => {
+    if (process.platform !== "linux") return;
+    scopeProcessScanToCase();
+    // 2.5s drain: past 9.5's 2s backstop, where the old stop gave up (false)
+    // and left the launcher alive.
+    installDrainingGateway({ forceDrain: "2.5", forceListen: true });
+    gateway = loadGateway();
+    await gateway.runGatewayCmd("--force");
+    expect(gateway.isManagedGatewayChildSupervisor()).toBe(true);
+    const workerPid = trackPid(readPid(path.join(caseDir, "worker-force.pid")));
+    trackPid(readPid(path.join(caseDir, "listener-force.pid")));
+    expect(gateway.getManagedGatewayWorkerPid()).toBe(workerPid);
+
+    const startedAt = Date.now();
+    const stopped = await gateway.stopGatewayChildAndWait({ budgetMs: 10_000 });
+    const elapsedMs = Date.now() - startedAt;
+    expect(stopped).toBe(true);
+    expect(elapsedMs).toBeGreaterThanOrEqual(2400);
+    expect(isPidAlive(workerPid)).toBe(false);
+    expect(fs.existsSync(path.join(caseDir, "worker-force.exited"))).toBe(true);
+  });
+
+  it("adopted cold-restart launcher (issue #56): past the budget the worker is SIGKILLed first, then the launcher — nothing orphaned on the port", async () => {
+    if (process.platform !== "linux") return;
+    scopeProcessScanToCase();
+    installDrainingGateway({ forceDrain: "never", forceListen: true });
+    gateway = loadGateway();
+    await gateway.runGatewayCmd("--force");
+    expect(gateway.isManagedGatewayChildSupervisor()).toBe(true);
+    const workerPid = trackPid(readPid(path.join(caseDir, "worker-force.pid")));
+    const listenerPid = trackPid(readPid(path.join(caseDir, "listener-force.pid")));
+
+    const startedAt = Date.now();
+    // Pre-fix: false after 2s with the launcher (and its gateway) left alive.
+    const stopped = await gateway.stopGatewayChildAndWait({ budgetMs: 1_000 });
+    const elapsedMs = Date.now() - startedAt;
+    expect(stopped).toBe(true);
+    expect(elapsedMs).toBeGreaterThanOrEqual(950);
+    expect(isPidAlive(workerPid)).toBe(false);
+    // The fixture's listener is the worker's own child (a real gateway's
+    // helpers die with it); reap it so the port is free for later cases.
+    try {
+      process.kill(listenerPid, "SIGKILL");
+    } catch {}
+  });
+
+  it("cold restart waits for the old gateway to release the port before spawning the replacement", async () => {
+    if (process.platform !== "linux") return;
+    scopeProcessScanToCase();
+    // The managed `gateway run` holds the port and the state-ownership
+    // projection; on SIGTERM it closes the port AT ONCE but keeps draining
+    // (and owning state) for 2s — the 2026.9.8 order. A port-only wait (9.5's
+    // 15s stop-settle) would spawn the replacement into that drain.
+    installDrainingGateway({ runDrain: "2", runListen: true, runHoldsState: true, forceListen: true });
+    gateway = loadGateway();
+    const child = await gateway.launchGatewayProcess();
+    trackPid(child.pid);
+    await pollUntil(() => readPid(path.join(caseDir, "listener-run.pid")) !== null, { label: "old listener" });
+    trackPid(readPid(path.join(caseDir, "worker-run.pid")));
+    trackPid(readPid(path.join(caseDir, "listener-run.pid")));
+    await pollUntil(() => gateway.isGatewayRunning(), { label: "old gateway port answering" });
+
+    const result = await gateway.restartGateway(() => {});
+    trackPid(readPid(path.join(caseDir, "worker-force.pid")));
+    trackPid(readPid(path.join(caseDir, "listener-force.pid")));
+
+    expect(result).toMatchObject({ ok: true });
+    const oldExitedAt = readNs(path.join(caseDir, "worker-run.exited"));
+    const replacementAt = readNs(path.join(caseDir, "launch-force.at"));
+    expect(oldExitedAt).not.toBeNull();
+    expect(replacementAt).not.toBeNull();
+    // The replacement was spawned only AFTER the old gateway finished its
+    // drain and exited — never raced against it with `--force`.
+    expect(replacementAt > oldExitedAt).toBe(true);
+    expect(result.downtimeMs).toBeGreaterThanOrEqual(1900);
+    expect(fs.existsSync(stateLockPath)).toBe(false);
+    // Clean up the adopted replacement through the same stop contract.
+    expect(await gateway.stopGatewayChildAndWait({ budgetMs: 10_000 })).toBe(true);
   });
 });

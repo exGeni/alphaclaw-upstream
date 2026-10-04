@@ -30,10 +30,11 @@ describe("GATEWAY_RESTART_READY_TIMEOUT clamp (module-load read)", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const constants = await loadConstantsWithEnv(undefined);
     expect(constants.kGatewayRestartReadyTimeoutMs).toBe(300_000);
-    // budget = ready + 240s preflight worst case + 90s margin, floored at
-    // the 10-min lease.
+    // budget = ready + 240s preflight worst case + the gateway stop budget
+    // (345s default: OpenClaw 2026.9.8's 330s + 15s, waited out BEFORE the
+    // spawn) + 45s stop-cmd/reap/spawn margin, floored at the 10-min lease.
     expect(constants.kGatewayRestartOperationBudgetMs).toBe(
-      Math.max(600_000, 300_000 + 240_000 + 90_000),
+      Math.max(600_000, 300_000 + 240_000 + 345_000 + 45_000),
     );
     expect(warnSpy).not.toHaveBeenCalledWith(
       expect.stringContaining("GATEWAY_RESTART_READY_TIMEOUT"),
@@ -67,7 +68,7 @@ describe("GATEWAY_RESTART_READY_TIMEOUT clamp (module-load read)", () => {
     );
     // Even at the cap, the derived budget covers the wait with margin.
     expect(constants.kGatewayRestartOperationBudgetMs).toBe(
-      480_000 + 240_000 + 90_000,
+      480_000 + 240_000 + 345_000 + 45_000,
     );
   });
 

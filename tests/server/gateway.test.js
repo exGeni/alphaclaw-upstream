@@ -130,18 +130,33 @@ const createSocket = (isRunning) => {
   };
 };
 
-const createChild = () => ({
-  pid: 1234,
-  stdout: { on: vi.fn() },
-  stderr: { on: vi.fn() },
-  on: vi.fn(),
-  kill: vi.fn(),
-  exitCode: null,
-  // Real Node semantics: a live child has signalCode null; a SIGNAL-killed
-  // child sets signalCode and leaves exitCode null.
-  signalCode: null,
-  killed: false,
-});
+const createChild = () => {
+  const child = {
+    pid: 1234,
+    stdout: { on: vi.fn() },
+    stderr: { on: vi.fn() },
+    on: vi.fn(),
+    exitCode: null,
+    // Real Node semantics: a live child has signalCode null; a SIGNAL-killed
+    // child sets signalCode and leaves exitCode null.
+    signalCode: null,
+    killed: false,
+  };
+  // A cooperative gateway: SIGTERM is a graceful stop that completes (exit
+  // 143, openclaw >= 2026.9.1-beta.1), SIGKILL a signal death. The stop paths
+  // now wait for the real exit (OpenClaw 2026.9.6+ drain model) instead of
+  // giving up after 2s, so a mock that never exits would hold every stop for
+  // the full budget. Tests that need a gateway which ignores SIGTERM install
+  // their own `kill`.
+  child.kill = vi.fn((signal) => {
+    child.killed = true;
+    if (child.exitCode !== null || child.signalCode !== null) return true;
+    if (signal === "SIGKILL") child.signalCode = "SIGKILL";
+    else if (signal === "SIGTERM") child.exitCode = 143;
+    return true;
+  });
+  return child;
+};
 
 describe("server/gateway restart behavior", () => {
   beforeEach(() => {
@@ -2355,9 +2370,16 @@ describe("server/gateway restart behavior", () => {
       gateway.setGatewayExitHandler(null);
     });
 
-    it("stopGatewayChildAndWait never SIGKILLs an adopted supervisor (SIGKILL would orphan the draining gateway)", async () => {
-      const supervisor = createChild();
-      childProcess.spawn = vi.fn(() => supervisor);
+    // OpenClaw 2026.9.6+ drain model: the launcher forwards SIGTERM and waits
+    // for the serving gateway's own drain (up to its 330s stop budget), so
+    // NEITHER an adopted launcher nor a direct `gateway run` child may be
+    // SIGKILLed — or abandoned — before AlphaClaw's stop budget runs out.
+    it.each([
+      ["adopted cold-restart supervisor", true],
+      ["direct gateway run child", false],
+    ])("stopGatewayChildAndWait: %s — SIGTERM, then drain, then exit, no SIGKILL inside the budget", async (_label, adopted) => {
+      const child = createChild();
+      childProcess.spawn = vi.fn(() => child);
       childProcess.execSync = vi.fn(() => "");
       fs.existsSync = vi.fn(() => false);
       fs.readdirSync = vi.fn(() => []);
@@ -2367,19 +2389,67 @@ describe("server/gateway restart behavior", () => {
       vi.spyOn(process.stdout, "write").mockImplementation(() => true);
       vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 
-      await gateway.runGatewayCmd("--force");
-      expect(gateway.isManagedGatewayChildSupervisor()).toBe(true);
+      if (adopted) await gateway.runGatewayCmd("--force");
+      else await gateway.launchGatewayProcess();
+      expect(gateway.isManagedGatewayChildSupervisor()).toBe(adopted);
 
-      // Still alive after the grace: report NOT stopped, but no SIGKILL — the
-      // launcher exits with its gateway; the callers' `openclaw gateway stop`
-      // + port-release wait own the rest.
-      const stopped = await gateway.stopGatewayChildAndWait({ graceMs: 20 });
-      expect(stopped).toBe(false);
-      expect(supervisor.kill).toHaveBeenCalledWith("SIGTERM");
-      expect(supervisor.kill).not.toHaveBeenCalledWith("SIGKILL");
+      vi.useFakeTimers();
+      try {
+        const pending = gateway.stopGatewayChildAndWait({ budgetMs: 345_000 });
+        // 5 minutes of drain: far past 9.5's 2s backstop, inside the budget.
+        await vi.advanceTimersByTimeAsync(300_000);
+        expect(child.kill.mock.calls).toEqual([["SIGTERM"]]);
+        // The gateway finishes its drain and the launcher exits with its code.
+        child.exitCode = 0;
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(await pending).toBe(true);
+        expect(child.kill).not.toHaveBeenCalledWith("SIGKILL");
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
-    it("killManagedGatewayChildNow (shutdown-deadline reap) skips an adopted supervisor but SIGKILLs a direct child", async () => {
+    it.each([
+      ["adopted cold-restart supervisor", true],
+      ["direct gateway run child", false],
+    ])("stopGatewayChildAndWait: %s — a drain longer than the budget is SIGKILLed only after it", async (_label, adopted) => {
+      const child = createChild();
+      child.kill = vi.fn((sig) => {
+        child.killed = true;
+        if (sig === "SIGKILL") child.signalCode = "SIGKILL";
+        return true;
+      });
+      childProcess.spawn = vi.fn(() => child);
+      childProcess.execSync = vi.fn(() => "");
+      fs.existsSync = vi.fn(() => false);
+      fs.readdirSync = vi.fn(() => []);
+      net.createConnection = vi.fn(() => createSocket(true));
+      delete require.cache[modulePath];
+      const gateway = require(modulePath);
+      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+      vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      if (adopted) await gateway.runGatewayCmd("--force");
+      else await gateway.launchGatewayProcess();
+
+      vi.useFakeTimers();
+      try {
+        const pending = gateway.stopGatewayChildAndWait({ budgetMs: 20_000 });
+        await vi.advanceTimersByTimeAsync(19_000);
+        expect(child.kill.mock.calls).toEqual([["SIGTERM"]]);
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect(child.kill.mock.calls).toEqual([["SIGTERM"], ["SIGKILL"]]);
+        expect(await pending).toBe(true);
+        expect(console.warn).toHaveBeenCalledWith(
+          expect.stringContaining("past OpenClaw's own stop budget"),
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("killManagedGatewayChildNow (shutdown-deadline reap) SIGKILLs an adopted supervisor and a direct child alike", async () => {
       const supervisor = createChild();
       childProcess.spawn = vi.fn(() => supervisor);
       childProcess.execSync = vi.fn(() => "");
@@ -2391,11 +2461,14 @@ describe("server/gateway restart behavior", () => {
       vi.spyOn(process.stdout, "write").mockImplementation(() => true);
       vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 
+      // Reached only past the graceful budget (the process deadline is derived
+      // to outlive it). With no resolvable worker the launcher itself is the
+      // last process to reap; the worker-first order is proven against real
+      // processes in e2e-gateway-reap.test.js.
       await gateway.runGatewayCmd("--force");
-      expect(gateway.killManagedGatewayChildNow()).toBe(false);
-      expect(supervisor.kill).not.toHaveBeenCalled();
+      expect(gateway.killManagedGatewayChildNow()).toBe(true);
+      expect(supervisor.kill).toHaveBeenCalledWith("SIGKILL");
 
-      // A direct `gateway run` child is still reaped hard.
       const direct = createChild();
       childProcess.spawn = vi.fn(() => direct);
       delete require.cache[modulePath];
@@ -2403,23 +2476,6 @@ describe("server/gateway restart behavior", () => {
       await gateway2.launchGatewayProcess();
       expect(gateway2.killManagedGatewayChildNow()).toBe(true);
       expect(direct.kill).toHaveBeenCalledWith("SIGKILL");
-    });
-
-    it("stopGatewayChildAndWait still escalates to SIGKILL for a direct gateway run child", async () => {
-      const child = createChild();
-      childProcess.spawn = vi.fn(() => child);
-      fs.existsSync = vi.fn(() => false);
-      delete require.cache[modulePath];
-      const gateway = require(modulePath);
-      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-      vi.spyOn(process.stderr, "write").mockImplementation(() => true);
-
-      await gateway.launchGatewayProcess();
-      expect(gateway.isManagedGatewayChildSupervisor()).toBe(false);
-      const stopped = await gateway.stopGatewayChildAndWait({ graceMs: 20 });
-      expect(stopped).toBe(false); // the mock never exits
-      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
-      expect(child.kill).toHaveBeenCalledWith("SIGKILL");
     });
 
     it("resolves the adopted supervisor's gateway child pid from /proc and carries it into exit classification", async () => {
@@ -2774,7 +2830,7 @@ describe("server/gateway restart behavior", () => {
       const gateway = require(modulePath);
 
       await gateway.launchGatewayProcess();
-      const reaped = await gateway.stopGatewayChildAndWait({ graceMs: 50 });
+      const reaped = await gateway.stopGatewayChildAndWait({ budgetMs: 50 });
 
       expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
       expect(reaped).toBe(true);
@@ -3179,7 +3235,7 @@ describe("server/gateway restart behavior", () => {
       }
     });
 
-    it("warns and still force-restarts when the old gateway never releases the port", async () => {
+    it("never races the old gateway: no spawn while it holds the port, then FAILS at the stop budget without spawning (OpenClaw 2026.9.6+ drain model)", async () => {
       vi.useFakeTimers();
       try {
         const supervisor = createChild();
@@ -3187,7 +3243,8 @@ describe("server/gateway restart behavior", () => {
         childProcess.spawn = spawnMock;
         childProcess.execFile = execFileOk("");
         fs.existsSync = vi.fn(() => false);
-        // The port answers before AND after `stop`: a wedged old process.
+        // The port answers before AND after `stop`: an old gateway that keeps
+        // draining (or is wedged) on the port.
         net.createConnection = vi.fn(() => ({
           setTimeout: vi.fn(),
           destroy: vi.fn(),
@@ -3201,44 +3258,85 @@ describe("server/gateway restart behavior", () => {
         const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
         const onStep = vi.fn();
-        // The incumbent verdict REJECTS (P1 review fix): settle the handler
-        // up front so the fake-timer advance cannot leave it unhandled.
+        let settled = false;
         const pending = gateway
           .restartGateway(vi.fn(), { onStep })
-          .then(() => null, (error) => error);
-        await vi.advanceTimersByTimeAsync(16000);
+          .then(() => null, (error) => error)
+          .finally(() => {
+            settled = true;
+          });
+        // 9.5's 15s stop-settle and then some: still waiting, nothing spawned
+        // (`gateway --force` would refuse a verified listener, and a new
+        // gateway would only queue on state ownership).
+        await vi.advanceTimersByTimeAsync(300_000);
+        expect(settled).toBe(false);
+        expect(spawnMock).not.toHaveBeenCalled();
+        // Past the 345s default budget (330s upstream + 15s margin).
+        await vi.advanceTimersByTimeAsync(50_000);
         const error = await pending;
 
-        // The bounded stop-settle wait gave up loudly instead of declaring a
-        // false instant success against the old process...
+        expect(spawnMock).not.toHaveBeenCalled();
         expect(warnSpy).toHaveBeenCalledWith(
-          expect.stringContaining("still holds the port"),
+          expect.stringContaining("no replacement was started"),
         );
-        // ...and --force still ran to replace the wedged gateway.
-        expect(spawnMock).toHaveBeenCalledWith(
-          "openclaw",
-          ["gateway", "--force"],
-          expect.objectContaining({ env: expect.any(Object) }),
-        );
-        // The stop CLI itself succeeded, so the stopping step stays "done"
-        // (the warning status is reserved for a refused/failed stop)...
-        expect(onStep).toHaveBeenCalledWith({ step: "stopping", status: "done" });
-        // ...but "ready" from a port that NEVER released is the incumbent
-        // answering, not a restarted gateway: this pin moved from a claimed
-        // success to an honest incumbent verdict (WI-5.2), and from a RETURNED
-        // { ok:false, incumbent:true } to a THROWN GatewayIncumbentRestartError
-        // (P1 review fix: every caller relies on "restartGateway throws when
-        // the gateway did not restart"). No downtimeMs rides on a failure.
+        expect(onStep).toHaveBeenCalledWith({
+          step: "stopping",
+          status: "warning",
+          detail: expect.stringContaining("port never released"),
+        });
+        expect(onStep).not.toHaveBeenCalledWith({ step: "stopping", status: "done" });
         expect(error).toBeInstanceOf(gateway.GatewayIncumbentRestartError);
         expect(error).toBeInstanceOf(gateway.GatewayRestartError);
         expect(error.incumbent).toBe(true);
+        expect(error.message).toContain("within 345s of SIGTERM");
         expect(error.evidence).toEqual(
           expect.objectContaining({
             wasRunningBefore: true,
             stopConfirmed: false,
             cliRefused: false,
+            phase: "stop_release",
+            stopBudgetMs: 345_000,
+            portOpen: true,
           }),
         );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("cold restart waits for the old gateway to release the port before spawning the replacement", async () => {
+      vi.useFakeTimers();
+      try {
+        const supervisor = createChild();
+        const spawnMock = vi.fn(() => supervisor);
+        childProcess.spawn = spawnMock;
+        childProcess.execFile = execFileOk("");
+        fs.existsSync = vi.fn(() => false);
+        // The old gateway drains for 200s, then closes its listener; the
+        // replacement answers once spawned.
+        let portOpen = true;
+        net.createConnection = vi.fn(() => createSocket(portOpen || spawnMock.mock.calls.length > 0));
+        delete require.cache[modulePath];
+        const gateway = require(modulePath);
+        vi.spyOn(console, "warn").mockImplementation(() => {});
+
+        const onStep = vi.fn();
+        const pending = gateway
+          .restartGateway(vi.fn(), { onStep })
+          .then((result) => result, (error) => error);
+        await vi.advanceTimersByTimeAsync(200_000);
+        expect(spawnMock).not.toHaveBeenCalled();
+        portOpen = false;
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(spawnMock).toHaveBeenCalledWith(
+          "openclaw",
+          ["gateway", "--force"],
+          expect.objectContaining({ env: expect.any(Object) }),
+        );
+        await vi.advanceTimersByTimeAsync(5_000);
+        const result = await pending;
+        expect(result).toMatchObject({ ok: true });
+        expect(onStep).toHaveBeenCalledWith({ step: "stopping", status: "done" });
       } finally {
         vi.useRealTimers();
       }
@@ -3386,7 +3484,7 @@ describe("server/gateway restart behavior", () => {
       vi.useFakeTimers();
       try {
         let expired = false;
-        const pending = gateway.stopGatewayChildAndWait({ graceMs: 100, shouldAbort: () => expired });
+        const pending = gateway.stopGatewayChildAndWait({ budgetMs: 100, shouldAbort: () => expired });
         if (boundary === "expired lease") expired = true;
         else expect(await gateway.launchGatewayProcess()).toBe(successor);
         await vi.advanceTimersByTimeAsync(1200);
@@ -4282,7 +4380,7 @@ describe("server/gateway restart behavior", () => {
       expect(verdict.detail).toContain("1 pre-restart gateway process(es) still alive (pid 10)");
     });
 
-    it("streams stopping: warning and REJECTS with GatewayIncumbentRestartError (no autotune stamp, no launch notice) when the stop is refused and the incumbent keeps the port", async () => {
+    it("streams stopping: warning and REJECTS with GatewayIncumbentRestartError (no autotune stamp, no launch notice) when the stop is refused and the incumbent keeps the port — at the stop budget, with NO replacement spawned", async () => {
       vi.useFakeTimers();
       try {
         lockContention.listLiveOpenclawProcesses.mockReturnValue([
@@ -4317,7 +4415,9 @@ describe("server/gateway restart behavior", () => {
         const pending = gateway
           .restartGateway(vi.fn(), { onStep })
           .then(() => null, (error) => error);
-        await vi.advanceTimersByTimeAsync(16000);
+        // The surviving pre-stop pid blocks the replacement for the whole
+        // stop budget (345s default), not 9.5's 15s stop-settle.
+        await vi.advanceTimersByTimeAsync(350_000);
         const error = await pending;
 
         // THROWN, not returned: the class every restartGateway() caller can
@@ -4329,7 +4429,7 @@ describe("server/gateway restart behavior", () => {
           code: "restart_incumbent",
           reason: "incumbent_gateway_still_running",
           incumbent: true,
-          detail: expect.stringContaining("the previous gateway is still running"),
+          detail: expect.stringContaining("it did not release"),
           evidence: expect.objectContaining({
             wasRunningBefore: true,
             stopConfirmed: false,
@@ -4337,16 +4437,14 @@ describe("server/gateway restart behavior", () => {
             cliExitCode: 1,
             cliForced: false,
             preStopPids: [777],
-            postReadyPids: [777],
-            newPids: [],
             survivingPids: [777],
-            supervisorPid: 1234,
-            stderrTail: expect.any(Array),
-            stdoutTail: expect.any(Array),
+            phase: "stop_release",
+            portOpen: true,
           }),
         });
         expect(error.message).toContain("Gateway restart did not take effect");
-        expect(error.message).toContain("refused the non-interactive stop");
+        expect(error.message).toContain("gateway pids 777");
+        expect(error.message).toContain("was refused by the CLI");
         const stopping = onStep.mock.calls
           .map(([step]) => step)
           .filter((step) => step.step === "stopping");
@@ -4358,19 +4456,16 @@ describe("server/gateway restart behavior", () => {
             detail: expect.stringContaining("was refused by the CLI"),
           },
         ]);
-        expect(onStep).toHaveBeenCalledWith(
-          expect.objectContaining({ step: "waiting_ready", status: "warning" }),
+        expect(onStep).not.toHaveBeenCalledWith(
+          expect.objectContaining({ step: "waiting_ready" }),
         );
         expect(warnSpy).toHaveBeenCalledWith(
-          expect.stringContaining("did NOT take effect"),
+          expect.stringContaining("no replacement was started"),
         );
-        // The --force supervisor still ran (it may still win the race)...
-        expect(childProcess.spawn).toHaveBeenCalledWith(
-          "openclaw",
-          ["gateway", "--force"],
-          expect.anything(),
-        );
-        // ...but nothing claimed success: no autotune stamp, no launch notice.
+        // No `--force` race against the incumbent (OpenClaw 2026.9.8 refuses
+        // to kill a verified listener non-interactively anyway)...
+        expect(childProcess.spawn).not.toHaveBeenCalled();
+        // ...and nothing claimed success: no autotune stamp, no launch notice.
         expect(stampSpy).not.toHaveBeenCalled();
         expect(launchHandler).not.toHaveBeenCalled();
         gateway.setGatewayLaunchHandler(null);
@@ -4402,7 +4497,7 @@ describe("server/gateway restart behavior", () => {
         const pending = gateway
           .restartGateway(vi.fn(), { onStep })
           .then(() => null, (error) => error);
-        await vi.advanceTimersByTimeAsync(16000);
+        await vi.advanceTimersByTimeAsync(350_000);
         const error = await pending;
 
         expect(onStep).toHaveBeenCalledWith({
