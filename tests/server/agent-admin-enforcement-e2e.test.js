@@ -83,6 +83,7 @@ const createApp = ({
   app.get("/api/status", echo); // safe
   app.put("/api/env", echo); // restart (body-aware; empty .env ⇒ restart)
   app.delete("/api/agents/:id", echo); // dangerous
+  app.put("/api/agents/:id", echo); // write; skills/models body-aware
   app.post("/api/unmapped/thing", echo); // NOT in the manifest
   // env.list: safe read carrying a secret VALUE the middleware must strip.
   app.get("/api/env", (req, res) =>
@@ -126,6 +127,32 @@ describe("agent-admin composed enforcement (confirm flow + audit + redaction + h
     if (dbRoot) {
       fs.rmSync(dbRoot, { recursive: true, force: true });
       dbRoot = null;
+    }
+  });
+
+  // agents.update skills tier through the REAL /api mount (req.path is
+  // mount-trimmed there): narrowing passes as write, widening needs a code.
+  it("agents.update skills: narrowing passes without a confirm, widening gets 428", async () => {
+    const openclawConfig = require("../../lib/server/openclaw-config");
+    const spy = vi.spyOn(openclawConfig, "readOpenclawConfig").mockReturnValue({
+      agents: { list: [{ id: "reception", skills: ["faq", "grant-intake"] }] },
+    });
+    try {
+      const { confirmService } = useRealConfirmService();
+      const { app } = createApp({ confirmService });
+
+      const narrow = await withBearer(
+        request(app).put("/api/agents/reception").send({ skills: ["faq"] }),
+      );
+      expect(narrow.status).toBe(200);
+      expect(narrow.body.echoed).toEqual({ skills: ["faq"] });
+
+      const widen = await withBearer(
+        request(app).put("/api/agents/reception").send({ skills: ["faq", "github"] }),
+      );
+      expect(widen.status).toBe(428);
+    } finally {
+      spy.mockRestore();
     }
   });
 
