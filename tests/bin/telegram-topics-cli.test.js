@@ -171,8 +171,30 @@ describe("bin/alphaclaw telegram topic commands", () => {
       expect(cfg.channels.telegram.accounts).toBeUndefined();
     });
 
+    it("refuses an unknown --agent and prints the topic keys a sync drops (0.9.95-exgenius.7)", () => {
+      writeConfig({
+        agents: { list: [{ id: "main" }] },
+        channels: {
+          telegram: {
+            enabled: true,
+            groups: { "-100123": { topics: { "39": { agentId: "main", systemPrompt: "config only" } } } },
+          },
+        },
+      });
+      const refused = runCli([
+        "telegram", "topic", "add", "--thread", "12", "--name", "Ops", "--agent", "ghost",
+      ]);
+      expect(refused.status).toBe(1);
+      expect(refused.stderr).toContain('Unknown agent "ghost"');
+      expect(fs.existsSync(registryPath())).toBe(false);
+
+      const mapped = runCli(["telegram", "topic", "add", "--thread", "12", "--name", "Ops", "--agent", "main"]);
+      expect(mapped.status).toBe(0);
+      expect(mapped.stdout).toContain("Topic config changes: removed=39 added=12");
+    });
+
     it("resolves accounts.*.groups and passes the accountId through to config sync", () => {
-      writeConfig(kAccountsConfig);
+      writeConfig({ ...kAccountsConfig, agents: { list: [{ id: "main" }, { id: "qa" }] } });
       const result = runCli([
         "telegram", "topic", "add", "--thread", "9", "--name", "QA", "--agent", "qa",
       ]);
@@ -295,7 +317,7 @@ describe("bin/alphaclaw telegram topic commands", () => {
       JSON.parse(fs.readFileSync(fetchCapturePath(), "utf8"));
 
     it("creates the forum topic, registers it, and syncs config + prompts", () => {
-      writeConfig(kTopLevelConfig);
+      writeConfig({ ...kTopLevelConfig, agents: { list: [{ id: "main" }, { id: "ops" }] } });
       const result = runCli(
         [
           "telegram", "topic", "create",
