@@ -103,6 +103,7 @@ describe("server/telegram-workspace", () => {
     writeOpenclawConfig({
       dir: openclawDir,
       config: {
+        agents: { list: [{ id: "main" }, { id: "ops" }] },
         channels: {
           telegram: {
             groups: {
@@ -149,7 +150,10 @@ describe("server/telegram-workspace", () => {
   it("skips discovered and deleted topics when writing config topics", () => {
     writeOpenclawConfig({
       dir: openclawDir,
-      config: { channels: { telegram: { groups: { "-100777": {} } } } },
+      config: {
+        agents: { list: [{ id: "main" }, { id: "ops" }] },
+        channels: { telegram: { groups: { "-100777": {} } } },
+      },
     });
 
     const topicRegistry = {
@@ -247,6 +251,8 @@ describe("server/telegram-workspace", () => {
       maxConcurrent: 8,
       subagentMaxConcurrent: 6,
       actionsChanged: true,
+      topicChanges: { removed: [], added: [], changed: [] },
+      danglingAgentTopics: [],
     });
     const nextConfig = readOpenclawConfig({ dir: openclawDir });
     const group = nextConfig.channels.telegram.groups["-100999"];
@@ -313,6 +319,7 @@ describe("server/telegram-workspace", () => {
     writeOpenclawConfig({
       dir: openclawDir,
       config: {
+        agents: { list: [{ id: "main" }, { id: "ops" }] },
         channels: {
           telegram: {
             accounts: {
@@ -668,5 +675,46 @@ describe("server/telegram-workspace resolveAccountIdForGroup", () => {
     expect(
       resolveAccountIdForGroup({ cfg: cfgWithAccounts, groupId: "" }),
     ).toBeNull();
+  });
+});
+
+describe("syncConfigForTelegram reports what the topic rebuild changed (0.9.95-exgenius.7)", () => {
+  it("reports a config-only topic it drops, a registry topic it re-adds, and routes to unknown agents", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "alphaclaw-topic-report-"));
+    fs.writeFileSync(
+      path.join(dir, "openclaw.json"),
+      JSON.stringify({
+        agents: { list: [{ id: "main" }] },
+        channels: {
+          telegram: {
+            groups: {
+              "-100": {
+                topics: {
+                  "14": { agentId: "main" },
+                  "39": { agentId: "main", systemPrompt: "config only" },
+                },
+              },
+            },
+          },
+        },
+      }),
+    );
+    const topicRegistry = {
+      getGroupStrict: () => ({
+        topics: {
+          "14": { name: "A", agentId: "main" },
+          "16": { name: "B", agentId: "dispatcher-ghost" },
+          "39": { name: "C", discovered: true },
+        },
+      }),
+      getActiveTopicCountStrict: () => 2,
+    };
+    const result = syncConfigForTelegram({ fs, openclawDir: dir, topicRegistry, groupId: "-100" });
+    // 16 routes to a deleted agent: reported, not written (decided under the config lock).
+    expect(result.topicChanges).toEqual({ removed: ["39"], added: [], changed: [] });
+    expect(result.danglingAgentTopics).toEqual([{ threadId: "16", agentId: "dispatcher-ghost" }]);
+    const written = JSON.parse(fs.readFileSync(path.join(dir, "openclaw.json"), "utf8"));
+    expect(written.channels.telegram.groups["-100"].topics).toEqual({ "14": { agentId: "main" } });
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });

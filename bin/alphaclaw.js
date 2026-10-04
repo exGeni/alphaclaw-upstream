@@ -766,6 +766,22 @@ const syncTelegramWorkspaceArtifacts = ({
   console.log(
     `[alphaclaw] Concurrency updated: agent=${syncResult.maxConcurrent} subagents=${syncResult.subagentMaxConcurrent} topics=${syncResult.totalTopics}`,
   );
+  // The sync rebuilds the whole group's topic routing from the registry:
+  // print what it removed/added/changed so nothing is dropped silently.
+  const { formatTopicChanges } = require("../lib/server/telegram-topic-agents");
+  const changes = formatTopicChanges(syncResult.topicChanges);
+  if (changes) console.log(`[alphaclaw] Topic config changes: ${changes}`);
+  for (const t of syncResult.danglingAgentTopics || []) {
+    console.warn(
+      `[alphaclaw] Warning: topic ${t.threadId} not written: it routes to unknown agent "${t.agentId}"`,
+    );
+  }
+};
+
+// Refuses a topic agent id the config does not know (telegram-topic-agents.js).
+const checkCliTopicAgentId = ({ cfg, agentId }) => {
+  const { checkTopicAgentId } = require("../lib/server/telegram-topic-agents");
+  return checkTopicAgentId({ cfg, openclawDir, agentId });
 };
 
 const runTelegramTopicAdd = () => {
@@ -799,6 +815,11 @@ const runTelegramTopicAdd = () => {
       return 1;
     }
     const { groupId, accountId, requireMention } = target;
+    const agentError = checkCliTopicAgentId({ cfg, agentId });
+    if (agentError) {
+      console.error(`[alphaclaw] ${agentError}`);
+      return 1;
+    }
 
     const topicRegistry = require("../lib/server/topic-registry");
     topicRegistry.updateTopic(
@@ -872,6 +893,11 @@ const runTelegramTopicCreate = async () => {
       return 1;
     }
     const { groupId, accountId, requireMention } = target;
+    const agentError = checkCliTopicAgentId({ cfg, agentId });
+    if (agentError) {
+      console.error(`[alphaclaw] ${agentError}`);
+      return 1;
+    }
 
     const { createTelegramApi } = require("../lib/server/telegram-api");
     const accountEnvKey = deriveTelegramAccountEnvKey(accountId);
