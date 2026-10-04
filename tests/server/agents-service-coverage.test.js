@@ -261,6 +261,102 @@ describe("server/agents/service coverage", () => {
       expect(emptied.tools).toEqual({});
     });
 
+    describe("deleteAgent unroutes the agent's Telegram topics (0.9.95-exgenius.7)", () => {
+      const build = (registry) => {
+        const fsMock = buildFsMock({
+          initialConfig: {
+            agents: { list: [{ id: "main", default: true }, { id: "dispatcher" }] },
+            channels: {
+              telegram: {
+                groups: {
+                  "-100": {
+                    topics: {
+                      "16": { agentId: "dispatcher" },
+                      "17": { agentId: "Dispatcher", systemPrompt: "keep me" },
+                      "39": { agentId: "main" },
+                    },
+                  },
+                },
+                accounts: {
+                  work: { groups: { "-200": { topics: { "5": { agentId: "dispatcher" } } } } },
+                },
+              },
+            },
+          },
+        });
+        const service = createAgentsService({ fs: fsMock, OPENCLAW_DIR, topicRegistry: registry });
+        return { fsMock, service };
+      };
+
+      it("clears topic agentId in openclaw.json and in the registry, and reports both", () => {
+        const registry = {
+          clearAgentReferences: vi.fn(() => [{ groupId: "-100", threadId: "16" }]),
+        };
+        const { fsMock, service } = build(registry);
+        const result = service.deleteAgent("dispatcher");
+        const telegram = fsMock.readConfig().channels.telegram;
+        expect(telegram.groups["-100"].topics).toEqual({
+          "17": { systemPrompt: "keep me" },
+          "39": { agentId: "main" },
+        });
+        expect(telegram.accounts.work.groups["-200"]).not.toHaveProperty("topics");
+        expect(registry.clearAgentReferences).toHaveBeenCalledWith("dispatcher", { source: "agent-delete" });
+        expect(result).toEqual({
+          ok: true,
+          unroutedTopics: {
+            config: [
+              { groupId: "-100", threadId: "16" },
+              { groupId: "-100", threadId: "17" },
+              { accountId: "work", groupId: "-200", threadId: "5" },
+            ],
+            registry: [{ groupId: "-100", threadId: "16" }],
+          },
+        });
+      });
+
+      it("puts the registry routes back when the config write fails (codex)", () => {
+        const registry = {
+          clearAgentReferences: vi.fn(() => [{ groupId: "-100", threadId: "16", agentId: "dispatcher" }]),
+          updateTopic: vi.fn(),
+        };
+        const { fsMock, service } = build(registry);
+        fsMock.writeFileSync.mockImplementation(() => {
+          throw new Error("disk full");
+        });
+        expect(() => service.deleteAgent("dispatcher")).toThrow();
+        expect(registry.updateTopic).toHaveBeenCalledWith("-100", "16", { agentId: "dispatcher" }, {
+          source: "agent-delete-rollback",
+        });
+      });
+
+      it("names registry routes it could not restore after a failed config write (codex)", () => {
+        const registry = {
+          clearAgentReferences: vi.fn(() => [{ groupId: "-100", threadId: "16", agentId: "dispatcher" }]),
+          updateTopic: vi.fn(() => {
+            throw new Error("lock timeout");
+          }),
+        };
+        const { fsMock, service } = build(registry);
+        fsMock.writeFileSync.mockImplementation(() => {
+          throw new Error("disk full");
+        });
+        expect(() => service.deleteAgent("dispatcher")).toThrow("NOT restored (re-add with a topic PUT): -100/16->dispatcher");
+      });
+
+      it("refuses the delete (openclaw.json untouched, retryable) when the registry clear fails", () => {
+        const registry = {
+          clearAgentReferences: vi.fn(() => {
+            throw new Error("Refusing to touch topic-registry.json: file exists but is not valid JSON");
+          }),
+        };
+        const { fsMock, service } = build(registry);
+        expect(() => service.deleteAgent("dispatcher")).toThrow("not valid JSON");
+        const cfg = fsMock.readConfig();
+        expect(cfg.agents.list.map((a) => a.id)).toContain("dispatcher");
+        expect(cfg.channels.telegram.groups["-100"].topics["16"]).toEqual({ agentId: "dispatcher" });
+      });
+    });
+
     describe("per-agent tools (profile / allow / alsoAllow / deny / fs)", () => {
       const buildToolsService = (receptionTools) =>
         buildService({
@@ -1504,7 +1600,7 @@ describe("server/agents/service coverage", () => {
       expect(() => service.deleteAgent("creds")).toThrow(
         'Agent "creds" owns agents.defaults.authInheritance.agentId and cannot be deleted',
       );
-      expect(service.deleteAgent("spare")).toEqual({ ok: true });
+      expect(service.deleteAgent("spare")).toMatchObject({ ok: true });
       expect(Object.keys(fsMock.readConfig().agents.entries)).toEqual([
         "main",
         "creds",
