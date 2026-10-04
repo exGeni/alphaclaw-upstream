@@ -261,6 +261,106 @@ describe("server/agents/service coverage", () => {
       expect(emptied.tools).toEqual({});
     });
 
+    describe("per-agent models (agentRuntime / params / codeMode)", () => {
+      const buildModelsService = (receptionModels) =>
+        buildService({
+          initialConfig: {
+            agents: {
+              defaults: {
+                models: { "anthropic/claude-sonnet-5-5": { agentRuntime: { id: "claude-cli" } } },
+              },
+              list: [
+                { id: "main", default: true },
+                { id: "reception", ...(receptionModels ? { models: receptionModels } : {}) },
+              ],
+            },
+          },
+        });
+
+      it("sets one agent's runtime without touching agents.defaults", async () => {
+        const { fsMock, service } = buildModelsService();
+        const updated = await service.updateAgent("reception", {
+          models: { "anthropic/claude-sonnet-5-5": { agentRuntime: { id: "openclaw" } } },
+        });
+        expect(updated.models).toEqual({
+          "anthropic/claude-sonnet-5-5": { agentRuntime: { id: "openclaw" } },
+        });
+        const saved = fsMock.readConfig().agents;
+        expect(saved.defaults.models).toEqual({
+          "anthropic/claude-sonnet-5-5": { agentRuntime: { id: "claude-cli" } },
+        });
+        expect(saved.list.find((a) => a.id === "main")).not.toHaveProperty("models");
+      });
+
+      it("merges by model id, removes with null and clears with models: null", async () => {
+        const { fsMock, service } = buildModelsService({
+          "openai/gpt-5.6-luna": { agentRuntime: { id: "openclaw" } },
+        });
+        await service.updateAgent("reception", {
+          models: { "anthropic/claude-sonnet-5-5": { agentRuntime: { id: "openclaw" }, codeMode: false } },
+        });
+        let reception = fsMock.readConfig().agents.list.find((a) => a.id === "reception");
+        expect(Object.keys(reception.models)).toEqual([
+          "openai/gpt-5.6-luna",
+          "anthropic/claude-sonnet-5-5",
+        ]);
+        await service.updateAgent("reception", { models: { "openai/gpt-5.6-luna": null } });
+        reception = fsMock.readConfig().agents.list.find((a) => a.id === "reception");
+        expect(Object.keys(reception.models)).toEqual(["anthropic/claude-sonnet-5-5"]);
+        await service.updateAgent("reception", { models: null });
+        reception = fsMock.readConfig().agents.list.find((a) => a.id === "reception");
+        expect(reception).not.toHaveProperty("models");
+      });
+
+      it("patches an entry field by field, keeping the runtime and keys it does not edit", async () => {
+        const { fsMock, service } = buildModelsService({
+          "anthropic/claude-sonnet-5-5": {
+            agentRuntime: { id: "openclaw" },
+            alias: "sonnet",
+            streaming: false,
+            params: { temperature: 0.2 },
+          },
+        });
+        await service.updateAgent("reception", {
+          models: { "anthropic/claude-sonnet-5-5": { codeMode: false, params: null } },
+        });
+        const entry = fsMock
+          .readConfig()
+          .agents.list.find((a) => a.id === "reception").models["anthropic/claude-sonnet-5-5"];
+        expect(entry).toEqual({
+          agentRuntime: { id: "openclaw" },
+          alias: "sonnet",
+          streaming: false,
+          codeMode: false,
+        });
+      });
+
+      it("keeps an explicitly supplied empty entry (model registration)", async () => {
+        const { fsMock, service } = buildModelsService();
+        await service.updateAgent("reception", { models: { "vllm/*": {} } });
+        const reception = fsMock.readConfig().agents.list.find((a) => a.id === "reception");
+        expect(reception.models).toEqual({ "vllm/*": {} });
+      });
+
+      it("rejects unknown runtimes, keys and entry shapes without writing", async () => {
+        const { fsMock, service } = buildModelsService();
+        const before = JSON.stringify(fsMock.readConfig());
+        const cases = [
+          [{ "anthropic/claude-sonnet-5-5": { agentRuntime: { id: "bogus" } } }, "agentRuntime.id must be one of"],
+          [{ "anthropic/claude-sonnet-5-5": { foo: 1 } }, "unsupported keys: foo"],
+          [{ "anthropic/claude-sonnet-5-5": { agentRuntime: { id: "openclaw", x: 1 } } }, "agentRuntime has unsupported keys"],
+          [{ "no-slash": { agentRuntime: { id: "openclaw" } } }, "is not a provider/model id"],
+          [{ "anthropic/claude-sonnet-5-5": { codeMode: "yes" } }, "codeMode must be true or false"],
+          [["anthropic/claude-sonnet-5-5"], "models must be an object"],
+          [{ "vllm/*": { codeMode: true } }, "codeMode is not allowed on a wildcard model ref"],
+        ];
+        for (const [models, message] of cases) {
+          await expect(service.updateAgent("reception", { models })).rejects.toThrow(message);
+        }
+        expect(JSON.stringify(fsMock.readConfig())).toBe(before);
+      });
+    });
+
     it("rejects invalid thinkingDefault values", async () => {
       const { service } = buildService();
       await expect(
