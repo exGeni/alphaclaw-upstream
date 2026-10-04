@@ -629,3 +629,35 @@ describe("agents.update tier", () => {
     expect(tierResolver({ body: { name: "X" } })).toBe("write");
   });
 });
+
+describe("agents.update skills tier", () => {
+  const { createSkillsTier } = require("../../lib/server/admin-manifest/domains/agents.js");
+  const tierFor = (cfg) => createSkillsTier({ readConfig: () => cfg });
+  // Express shape under app.use("/api", enforcement): mount-trimmed path.
+  const req = (skills) => ({ baseUrl: "/api", path: "/agents/reception", body: { skills } });
+
+  it("narrowing is write; widening or removing is dangerous", () => {
+    const cfg = { agents: { list: [{ id: "reception", skills: ["faq", "grant-intake"] }] } };
+    const tier = tierFor(cfg);
+    expect(tier(req(["faq"]))).toBe("write");
+    expect(tier(req([]))).toBe("write");
+    expect(tier(req(["faq", "github"]))).toBe("dangerous");
+    expect(tier(req(null))).toBe("dangerous");
+    expect(tier({ baseUrl: "/api", path: "/agents/reception", body: { name: "X" } })).toBe("write");
+  });
+
+  it("compares against inherited defaults, and any list narrows an unrestricted agent", () => {
+    const inherited = tierFor({ agents: { defaults: { skills: ["github"] }, list: [{ id: "reception" }] } });
+    expect(inherited(req(["github"]))).toBe("write");
+    expect(inherited(req(["weather"]))).toBe("dangerous");
+    const unrestricted = tierFor({ agents: { list: [{ id: "reception" }] } });
+    expect(unrestricted(req(["anything"]))).toBe("write");
+  });
+
+  it("fails closed on unreadable config or a non-list own skills value", () => {
+    expect(() => tierFor(null)(req(["x"]))).toThrow("config unreadable");
+    expect(() =>
+      tierFor({ agents: { list: [{ id: "reception", skills: null }] } })(req(["x"])),
+    ).toThrow("agent skills is not a list");
+  });
+});
