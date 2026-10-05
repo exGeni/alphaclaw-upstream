@@ -159,6 +159,25 @@ describe("gateway reap e2e (real child processes via PATH-shimmed openclaw)", ()
         process.kill(pid, "SIGKILL");
       } catch {}
     }
+    // Last resort for fixture grandchildren no pidfile named (a listener
+    // re-parented after its worker died): every process whose argv lives
+    // under this file's private tmp root is ours to reap.
+    if (process.platform === "linux") {
+      for (const name of fs.readdirSync("/proc")) {
+        if (!/^\d+$/.test(name) || Number(name) === process.pid) continue;
+        let cmdline = "";
+        try {
+          cmdline = fs.readFileSync(`/proc/${name}/cmdline`, "utf8");
+        } catch {
+          continue;
+        }
+        if (cmdline.includes(kTmpRoot)) {
+          try {
+            process.kill(Number(name), "SIGKILL");
+          } catch {}
+        }
+      }
+    }
     process.env.PATH = originalPath;
     delete require.cache[kGatewayModulePath];
   });
