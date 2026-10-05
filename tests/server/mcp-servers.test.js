@@ -1703,3 +1703,125 @@ describe("round 8: one tool-name rule, merged-entry checks, safe server names (R
     expect(own.body).not.toHaveProperty("field");
   });
 });
+
+describe("round 9: token-shape names, bounds on every set, repeated decoding (R9)", () => {
+  const { looksLikeTokenName, isAcceptableToolName } = require("../../lib/server/mcp-servers");
+  // Token-shaped fixtures are assembled at runtime; none is real.
+  const liveKey = "sk_" + "live_" + "a1B2c3D4e5F6g7H8i9J0k1L2";
+  const uuid = "3f2b8c1e-9d4a-4e7b-a6c5-1b2d3e4f5a6b";
+
+  it("R9 1+2: one token-shape rule for server and tool names", async () => {
+    const serverNames = [
+      "gbrain-acmeholdings2026",
+      "gbrain-northwind2025corp",
+      "gbrain-dispatcher-simlinks-knowledge",
+      "github-enterprise-cloud-production",
+      "pk-db",
+      "sk_internal",
+    ];
+    const dir = makeDir({ mcp: { servers: {} } });
+    const { app } = makeApp(dir);
+    for (const name of serverNames) {
+      expect(looksLikeTokenName(name), name).toBe(false);
+      const res = await request(app).put(`/api/mcp/servers/${name}`).send({ revision: "absent", url: "https://h.example.test/mcp" });
+      expect(res.status, name).toBe(201);
+    }
+    const listed = await request(app).get("/api/mcp/servers");
+    expect(listed.body.names).toEqual([...serverNames].sort());
+    for (const tool of ["hf_fs", "hf_whoami", "hf_*", "npm_search", "sk_list_tables"]) {
+      expect(isAcceptableToolName(tool), tool).toBe(true);
+      expect(parseServerPatch({ toolFilter: { include: [tool] } }).toolFilter.include).toEqual([tool]);
+      expect(redactMcpServerEntry({ toolFilter: { include: [tool] } }).toolFilter.include).toEqual([tool]);
+    }
+    for (const token of [liveKey, uuid]) {
+      expect(looksLikeTokenName(token)).toBe(true);
+      expect(codeOf(() => parseServerPatch({ toolFilter: { include: [token] } }))).toBe("invalid_tool_filter");
+      expect(redactMcpServerEntry({ toolFilter: { include: [token] } }).toolFilter.include).toEqual(["<redacted>"]);
+    }
+    const created = await request(app).put(`/api/mcp/servers/${liveKey}`).send({ revision: "absent", url: "https://h.example.test/mcp" });
+    expect(created.body.code).toBe("invalid_name");
+  });
+
+  it("R9 m4: a create the route refuses for its token-shaped name is write tier", () => {
+    const tier = createServerSetTier({ readConfig: () => ({ mcp: { servers: {} } }) });
+    expect(tier({ baseUrl: "/api", path: `/mcp/servers/${liveKey}`, body: { revision: "absent", url: "https://h.example.test/mcp" } })).toBe("write");
+    expect(tier({ baseUrl: "/api", path: "/mcp/servers/sk_internal", body: { revision: "absent", url: "https://h.example.test/mcp" } })).toBe("dangerous");
+  });
+
+  it("R9 m3: hidden names come after the visible ones, numbered by revision, so their position leaks nothing", async () => {
+    const tokenA = "gh" + "p_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+    const tokenB = "sk-" + "Zz9Yy8Xx7Ww6Vv5Uu4Tt3Ss2Rr1";
+    const entryA = { url: "https://a.example.test/mcp" };
+    const entryB = { url: "https://b.example.test/mcp" };
+    const byRev = [[tokenA, entryA], [tokenB, entryB]].sort(([, x], [, y]) => (entryRevision(x) < entryRevision(y) ? -1 : 1));
+    for (const order of [[tokenA, tokenB], [tokenB, tokenA]]) {
+      const servers = { zulu: entryA, alpha: entryA, mango: entryA };
+      for (const name of order) servers[name] = name === tokenA ? entryA : entryB;
+      const dir = makeDir({ mcp: { servers } });
+      const res = await request(makeApp(dir).app).get("/api/mcp/servers");
+      expect(res.body.names).toEqual(["alpha", "mango", "zulu", "<redacted-1>", "<redacted-2>"]);
+      expect(res.body.servers["<redacted-1>"].revision).toBe(entryRevision(byRev[0][1]));
+      expect(res.body.servers["<redacted-2>"].revision).toBe(entryRevision(byRev[1][1]));
+    }
+  });
+
+  it("codex P1: the bounds hold on every set; a stored over-limit entry is refused with field existing", async () => {
+    const refsOver = { a: "${DOCS_AUTH_TOKEN}", b: "${OTHER_AUTH_TOKEN}", c: "${EXTRA_AUTH_TOKEN}", d: "${ROTATED_AUTH_TOKEN}", e: "${TENANT_AUTH_TOKEN}" };
+    const many = Object.fromEntries(Array.from({ length: 33 }, (_, i) => [`X-${i}`, "${DOCS_AUTH_TOKEN}"]));
+    for (const [stored, code] of [
+      [{ url: "https://h.example.test/mcp", headers: refsOver, toolFilter: { include: ["a", "b"] } }, "too_many_env_refs"],
+      [{ url: "https://h.example.test/mcp", headers: many, toolFilter: { include: ["a", "b"] } }, "too_many_headers"],
+    ]) {
+      const dir = makeDir({ mcp: { servers: { docs: stored } } });
+      const { app } = makeApp(dir);
+      for (const patch of [{ transport: "sse" }, { toolFilter: { include: ["a"] } }, { requestTimeoutMs: 5 }]) {
+        const body = { revision: revOf(dir, "docs"), ...patch };
+        expect(createServerSetTier({ readConfig: () => readConfig(dir) })({ baseUrl: "/api", path: "/mcp/servers/docs", body }), code).toBe("write");
+        const res = await request(app).put("/api/mcp/servers/docs").send(body);
+        expect(res.status, `${code} ${JSON.stringify(patch)}`).toBe(400);
+        expect(res.body.code).toBe(code);
+        expect(res.body.field).toBe("existing");
+        expect(res.body.hint).toMatch(/operator must fix openclaw\.json/);
+      }
+      expect(readConfig(dir).mcp.servers.docs).toEqual(stored);
+    }
+    // A patch that brings the entry back within the bounds passes.
+    const dir = makeDir({ mcp: { servers: { docs: { url: "https://h.example.test/mcp", headers: refsOver } } } });
+    const fix = await request(makeApp(dir).app).put("/api/mcp/servers/docs").send({ revision: revOf(dir, "docs"), headers: { d: null, e: null } });
+    expect(fix.status).toBe(200);
+  });
+
+  it("codex P1: 1x, 2x and 3x percent-encoded tokens in path, query key and query value are refused and redacted", () => {
+    const enc = (text, times) => {
+      let out = text.replace(/^s/, "%73");
+      for (let i = 1; i < times; i += 1) out = out.replace(/%/g, "%25");
+      return out;
+    };
+    // Low-entropy body, so only the decoded "sk_" prefix makes it a
+    // credential: a check on fewer decode rounds misses it.
+    const plainToken = "sk_" + "abcdefghijklmnop";
+    expect(looksLikeCredential(plainToken)).toBe(true);
+    for (const notYet of ["%73k_abcdefghijklmnop", "%2573k_abcdefghijklmnop", "%252573k_abcdefghijklmnop"]) {
+      expect(looksLikeCredential(notYet), notYet).toBe(false);
+    }
+    const body = plainToken.slice(3);
+    for (const times of [1, 2, 3]) {
+      const token = enc(plainToken, times);
+      for (const url of [
+        `https://h.example.test/${token}/mcp`,
+        `https://h.example.test/mcp?${token}=1`,
+        `https://h.example.test/mcp?q=${token}`,
+        `https://h.example.test/mcp;${token}=1`,
+      ]) {
+        expect(codeOf(() => parseServerPatch({ url })), `${times}x ${url}`).toBe("literal_secret");
+        const shown = redactMcpServerEntry({ url }).url;
+        expect(shown, `${times}x list ${url}`).not.toContain(body);
+        const summary = describeServerSet({ name: "s", current: { url }, patch: { revision: entryRevision({ url }), requestTimeoutMs: 1 } });
+        expect(summary, `${times}x summary ${url}`).not.toContain(body.slice(0, 8));
+      }
+    }
+    // Malformed % stays as is and an ordinary encoded path is unaffected.
+    expect(parseServerPatch({ url: "https://h.example.test/a%ZZb/mcp" }).url).toBe("https://h.example.test/a%ZZb/mcp");
+    expect(parseServerPatch({ url: "https://h.example.test/my%2520docs/mcp" }).url).toBe("https://h.example.test/my%2520docs/mcp");
+  });
+});
