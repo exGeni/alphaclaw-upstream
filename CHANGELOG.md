@@ -5,6 +5,29 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [Unreleased]
+
+### Added
+
+- **Agent-admin MCP server ops** (domain `mcp`): `mcp.server-list` (`GET /api/mcp/servers`, safe), `mcp.server-set` (`PUT /api/mcp/servers/:name`) and `mcp.server-remove` (`DELETE /api/mcp/servers/:name`, dangerous) manage OpenClaw `mcp.servers.<name>` through the locked `updateOpenclawConfig` write path.
+  - Reads redact header and env values to their shape (`${VAR}` names plus an allowlisted scheme word; anything else `<literal>`). URLs (also `oauth.redirectUrl`/`clientMetadataUrl`) lose userinfo, query and `;matrix` values, fragments and credential-like path segments. `command` becomes `{program, argCount}`, and unknown keys are listed by name only. The redaction applies to dashboard and agent callers alike.
+  - `mcp.server-set` patches `url`, `transport`, `headers`, `toolFilter` `{include, exclude}` and `requestTimeoutMs` field by field and keeps keys it does not manage (`codex`, `enabled`, `auth`, ...). Unknown keys, an empty body, or a body that is not a JSON object are a 400, and a no-op body skips the write.
+  - A header value must be `[Bearer|Basic|Token|Bot|ApiKey ]${VAR}`; anything else is refused with 400 `literal_secret` and is not echoed in the response, the log or the audit row. `VAR` must reach the gateway under `gateway-env-policy.js` (400 `env_not_forwarded` names the var and rule). `OPENCLAW_*`/`ALPHACLAW_*`, the gateway/webhook tokens and `REMOTE_MCP_API_TOKEN` are refused (400 `env_reserved`).
+  - URLs with userinfo, a fragment, a credential-like path segment, or a credential-like query/`;matrix` parameter with a literal value are refused.
+  - Tier: narrowing an existing server with exact names (smaller include, larger exclude, timeout only) is write. A new server, a url/header/transport change, a widened or cleared filter, or any `*` glob (Codex's MCP projection asserts exact names) is dangerous. An unknown name without `url` is a 404, and the `REMOTE_MCP_NAME` key (default `remote`) answers 409 `managed_by_env` even while `REMOTE_MCP_*` is unset.
+  - Confirm prompts for these ops say what changes: set shows the server name, URL host, header names with their `${VAR}` names, transport and filter delta; remove shows the name.
+  - The agent-admin skill size budget test moves from 62k to 63k characters for the new domain.
+  - A referenced `${VAR}` must also be set and non-empty in AlphaClaw's environment (400 `env_not_set`). When it is missing from the env the running gateway daemon was spawned with, set answers `restartRequired: true` with a warning. `gateway-launch-env-snapshot.js` records the daemon env's variable names (never values) at each spawn.
+  - Confirm summaries for these ops lead with NEW/UPDATE, the URL host, transport, FILTER CLEARED / FILTER WIDENED, GLOB IN FILTER and header counts. Lists are summarised by count plus three names, tool names are reduced to `[A-Za-z0-9_.:/-]` and quoted, and credential-shaped fragments are `<redacted>`.
+  - Credential-shaped URL host labels are refused and redacted; a credential-shaped `command` program is redacted. Sensitive URL parameter keys match on the whole key or a delimited part, so `code_version`, `session` and `authorized` pass.
+- **Per-op confirm detail:** a manifest descriptor may define `confirmSummary({method, path, pathParams, query, body})`. `confirm-service.js` appends its line to the op title (house-format characters `` ` `` `*` `[` `]` neutralised, secret-shape scrubbed, control characters stripped, 400 characters max), and the serialized manifest marks such ops `detailedConfirm: true`. A throw or a non-string falls back to the title.
+
+### Changed
+
+- `gateway-env-policy.js` exports `classifyGatewayEnvKey(key)` → `{forwarded, rule}`; `filterGatewayChildEnv` now uses it per key, with the same decisions (`__proto__` is reported as not forwarded, which is what the filter's plain output object already did).
+- `REMOTE_MCP_NAME` resolution moved into `lib/server/remote-mcp-name.js`, shared by the gateway's managed-entry writer and the MCP ops.
+- `/api/mcp` joins the local-only API prefixes in `routes/proxy.js`, so its request bodies are parsed instead of being left for the gateway proxy.
+
 ## [0.9.99-exgenius.9] - 2026-10-04
 
 exGeni fork line rebuilt on upstream **v0.9.99** (`garrytan/alphaclaw` main
