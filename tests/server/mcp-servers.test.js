@@ -420,7 +420,7 @@ describe("mcp confirm summaries (M3)", () => {
         },
       }),
     ).toBe(
-      'server "docs" NEW; url host docs.example.test; transport sse; filter narrowed; headers set 1, removed 0; include +1 ["search"]; set Authorization=Bearer ${DOCS_AUTH_TOKEN}',
+      'server "docs" NEW; url https://docs.example.test/mcp?page=<redac~; SENDS ${DOCS_AUTH_TOKEN}; transport sse; filter narrowed; headers set 1, removed 0; include +1 ["search"]; set Authorization=Bearer ${DOCS_AUTH_TOKEN}',
     );
     expect(
       summary({ pathParams: { name: "brain" }, body: { toolFilter: { include: ["search", "put_page", "get_*"], exclude: ["query"] } } }),
@@ -428,7 +428,7 @@ describe("mcp confirm summaries (M3)", () => {
       'server "brain" UPDATE; FILTER WIDENED; GLOB IN FILTER; include +2 ["put_page", "get_~"] -2 ["get_page", "query"]; exclude +1 ["query"]',
     );
     expect(describeServerSet({ name: "brain", current: baseEntry(), patch: { headers: null, toolFilter: null } })).toBe(
-      'server "brain" UPDATE; FILTER CLEARED; ALL HEADERS REMOVED',
+      'server "brain" UPDATE; SENDS no credential TO brain.example.test; FILTER CLEARED; ALL HEADERS REMOVED',
     );
   });
 
@@ -730,9 +730,9 @@ describe("round 2: confirm summary cannot be steered by agent text (R2-1)", () =
     expect(widened.length).toBeLessThanOrEqual(400);
     expect(widened).toContain("FILTER WIDENED");
     expect(widened).toContain("GLOB IN FILTER");
-    expect(widened).not.toContain("url host");
+    expect(widened).not.toContain("; url ");
     const hostFirst = buildConfirmSummary(setOp(), req({ url: "https://new-host.example.test/mcp", headers, toolFilter: { include: many } }));
-    expect(hostFirst).toContain("url host new-host.example.test");
+    expect(hostFirst).toContain("url https://new-host.example.test/mcp; SENDS ${DOCS_AUTH_TOKEN}");
     expect(hostFirst).toContain("include +60");
   });
 
@@ -744,7 +744,7 @@ describe("round 2: confirm summary cannot be steered by agent text (R2-1)", () =
     expect(summary).toContain("<redacted>");
     expect(summary).not.toContain("a1B2c3D4");
     expect(describeServerSet({ name: "docs", current: undefined, patch: { url: "https://a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6.mcp.example.test/mcp" } })).toBe(
-      'server "docs" NEW; url host <redacted>.mcp.example.test',
+      'server "docs" NEW; url https://<redacted>.mcp.example.test/mcp; SENDS no credential',
     );
   });
 });
@@ -845,5 +845,153 @@ describe("round 2: url keys, host labels, command program, reserved-name wording
     expect(res.body.error).toContain("when REMOTE_MCP_URL and REMOTE_MCP_API_TOKEN are both set");
     expect(res.body.error).toContain("managed marker");
     expect(res.body.error).not.toContain("rewrites or removes");
+  });
+});
+
+describe("round 3: the confirm summary names every credential the entry sends, and where (R3)", () => {
+  const docs = { url: "https://d.example.test/mcp", headers: { Authorization: "Bearer ${GBRAIN_TEST_AUTH_TOKEN}" } };
+  const summaryFor = (body, current = docs, name = "docs") => {
+    const op = {
+      ...manifest.findOp("PUT", `/api/mcp/servers/${name}`),
+      confirmSummary: createServerSetConfirmSummary({ readConfig: () => ({ mcp: { servers: current ? { [name]: current } : {} } }) }),
+    };
+    return buildConfirmSummary(op, { method: "PUT", baseUrl: "/api", path: `/mcp/servers/${name}`, body, query: {} });
+  };
+
+  it("F1: clips a long host from the left, so the receiving domain stays visible", () => {
+    const host = "gbrain.tailnet-example.ts.net.mcp-gateway.regional-mirror.attacker-owned.example";
+    const summary = summaryFor({ url: `https://${host}/mcp` });
+    expect(summary).toContain("url https://~.");
+    expect(summary).toContain(".regional-mirror.attacker-owned.example/mcp");
+    expect(summary).not.toContain("gbrain.tailnet-example");
+    expect(describeServerSet({ name: "x", current: undefined, patch: { url: `https://${"a".repeat(60)}.example.test:8443/mcp` } })).toBe(
+      'server "x" NEW; url https://~.example.test:8443/mcp; SENDS no credential',
+    );
+    expect(describeServerSet({ name: "x", current: undefined, patch: { url: `https://${"a".repeat(60)}:8443/mcp` } })).toBe(
+      `server "x" NEW; url https://~${"a".repeat(39)}:8443/mcp; SENDS no credential`,
+    );
+  });
+
+  it("F2a: names ${VAR} references carried in the url query or path", () => {
+    const query = summaryFor({ url: "https://d.example.test/mcp?q=${MCP_API_KEY}" });
+    expect(query).toContain("SENDS ${MCP_API_KEY}, ${GBRAIN_TEST_AUTH_TOKEN}");
+    const inPath = summaryFor({ url: "https://d.example.test/${PATH_API_KEY}/mcp" }, undefined);
+    expect(inPath).toContain("url https://d.example.test/${PATH_API_KEY}~");
+    expect(inPath).toContain("SENDS ${PATH_API_KEY}");
+  });
+
+  it("F2b: names every header reference, not the first three", () => {
+    const summary = summaryFor({
+      headers: { "X-A": "${DOCS_AUTH_TOKEN}", "X-B": "${OTHER_AUTH_TOKEN}", "X-C": "${EXTRA_AUTH_TOKEN}", "X-D": "Bearer ${MCP_API_KEY}" },
+    }, { url: "https://d.example.test/mcp" });
+    expect(summary).toContain(
+      "SENDS ${DOCS_AUTH_TOKEN}, ${OTHER_AUTH_TOKEN}, ${EXTRA_AUTH_TOKEN}, ${MCP_API_KEY} TO d.example.test",
+    );
+  });
+
+  it("F2c: a long filter delta cannot push a header reference out of the summary", () => {
+    const many = Array.from({ length: 6 }, (_, i) => `search_pages_by_topic_number_${i}`);
+    const summary = summaryFor({
+      toolFilter: { include: many, exclude: many.map((t) => `x_${t}`) },
+      headers: { "X-Tenant": "${TENANT_AUTH_TOKEN}" },
+    });
+    expect(summary).toContain("SENDS ${GBRAIN_TEST_AUTH_TOKEN}, ${TENANT_AUTH_TOKEN} TO d.example.test");
+    expect(summary.indexOf("SENDS")).toBeLessThan(summary.indexOf("include"));
+  });
+
+  it("F2d: a url change names the existing headers that now go to the new host, literal ones by count", () => {
+    const summary = summaryFor(
+      { url: "https://elsewhere.example.test/mcp" },
+      { url: "https://d.example.test/mcp", headers: { Authorization: "Bearer ${GBRAIN_TEST_AUTH_TOKEN}", "X-Raw": kLiteralCore } },
+    );
+    expect(summary).toContain("url https://elsewhere.example.test/mcp; SENDS ${GBRAIN_TEST_AUTH_TOKEN}, 1 literal header");
+    expect(summary).not.toContain(kLiteralCore);
+  });
+
+  it("F2: refuses an entry with more distinct references than the summary can name, and says so", async () => {
+    const five = { "X-1": "${DOCS_AUTH_TOKEN}", "X-2": "${OTHER_AUTH_TOKEN}", "X-3": "${EXTRA_AUTH_TOKEN}", "X-4": "${ROTATED_AUTH_TOKEN}" };
+    const dir = makeDir({ mcp: { servers: { docs } } });
+    const res = await request(makeApp(dir).app).put("/api/mcp/servers/docs").send({ headers: five });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("too_many_env_refs");
+    expect(readConfig(dir).mcp.servers.docs).toEqual(docs);
+    expect(summaryFor({ headers: five })).toContain("SENDS 5 ${VAR} refs, OVER LIMIT (refused)");
+    // Character bound: three long names exceed it even under the count limit.
+    const long = ["A", "B", "C"].map((p) => `${p}_${"LONG_NAME_".repeat(2)}AUTH_TOKEN`);
+    const env = Object.fromEntries(long.map((n) => [n, "fixture-placeholder"]));
+    const longDir = makeDir({ mcp: { servers: {} } });
+    const longRes = await request(makeApp(longDir, { env }).app)
+      .put("/api/mcp/servers/wide")
+      .send({ url: "https://w.example.test/mcp", headers: Object.fromEntries(long.map((n, i) => [`X-${i}`, `\${${n}}`])) });
+    expect(longRes.status).toBe(400);
+    expect(longRes.body.code).toBe("too_many_env_refs");
+  });
+
+  it("F2: the worst-case critical part fits the 400-character clamp with every reference named", () => {
+    const refs = [0, 1, 2, 3].map((i) => `R${i}_X_AUTH_TOKEN`);
+    for (const ref of refs) vi.stubEnv(ref, "fixture-placeholder");
+    const name = "n".repeat(64);
+    const literal = Object.fromEntries(Array.from({ length: 999 }, (_, i) => [`L-${i}`, "plain"]));
+    const headers = Object.fromEntries(refs.map((r, i) => [`X-${i}`, `\${${r}}`]));
+    for (let i = 0; i < 999; i += 1) headers[`Y-${i}`] = null;
+    const host = `${Array.from({ length: 12 }, () => "mcpserver").join(".")}.com`;
+    const summary = summaryFor(
+      {
+        url: `https://${host}:65535/${"a".repeat(45)}?q=1`,
+        transport: "streamable-http",
+        toolFilter: { include: ["b*"], exclude: ["c"] },
+        headers,
+      },
+      { url: "http://x.example.test/mcp", toolFilter: { include: ["a"] }, headers: literal },
+      name,
+    );
+    expect(summary.length).toBeLessThanOrEqual(400);
+    expect(summary.endsWith("…")).toBe(false);
+    for (const ref of refs) expect(summary).toContain(`\${${ref}}`);
+    expect(summary).toContain("999 literal headers; transport streamable-http; FILTER WIDENED; GLOB IN FILTER; headers set 4, removed 999");
+  });
+
+  it("F3: an idempotent retry still reports restartRequired for a var the running gateway lacks", () => {
+    const dir = makeDir({ mcp: { servers: {} } });
+    const svc = createMcpServersService({
+      fsModule: fs,
+      openclawDir: dir,
+      log: { log: () => {} },
+      env: { NEW_AUTH_TOKEN: "fixture-placeholder" },
+      classifyEnv: () => ({ forwarded: true, rule: "test" }),
+      getLaunchedEnvKeys: () => new Set(["PATH"]),
+    });
+    const body = { url: "https://mcp.example.test/mcp", headers: { Authorization: "Bearer ${NEW_AUTH_TOKEN}" } };
+    expect(svc.setServer("svc", body)).toMatchObject({ changed: true, restartRequired: true });
+    const retry = svc.setServer("svc", body);
+    expect(retry).toMatchObject({ changed: false, restartRequired: true });
+    expect(retry.warning).toContain("${NEW_AUTH_TOKEN}");
+    expect(svc.setServer("svc", { requestTimeoutMs: 5000 })).toMatchObject({ changed: true, restartRequired: true });
+  });
+
+  it("F4: shows scheme and redacted path, marks a downgrade and an unchanged url", () => {
+    expect(summaryFor({ url: "http://d.example.test/mcp" })).toContain(
+      "url http://d.example.test/mcp (was https); SENDS ${GBRAIN_TEST_AUTH_TOKEN}",
+    );
+    // The route refuses such a url; the display path still goes through redactUrl.
+    expect(describeServerSet({ name: "docs", current: undefined, patch: { url: "https://d.example.test/mcp/sk-live-a1B2c3D4e5F6g7H8i9J0" } })).toBe(
+      'server "docs" NEW; url https://d.example.test/mcp/<redacted>; SENDS no credential',
+    );
+    expect(summaryFor({ url: "https://d.example.test/mcp", transport: "sse" })).toContain(
+      "url unchanged; SENDS ${GBRAIN_TEST_AUTH_TOKEN} TO d.example.test; transport sse",
+    );
+  });
+
+  it("F5: a long legitimate tool name is shown, a credential-shaped one is still redacted", () => {
+    const toolName = "inc_tool_name_number_0_abcdefghij";
+    expect(looksLikeCredential(toolName)).toBe(true); // whole-string entropy rule (urls)
+    const summary = describeServerSet({ name: "docs", current: docs, patch: { toolFilter: { exclude: [toolName, "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"] } } });
+    expect(summary).toContain('exclude +2 ["inc_tool_name_number_0_abcdefghi~", <redacted>]');
+  });
+
+  it("F6: tool names lose []() before they are quoted", () => {
+    expect(describeServerSet({ name: "docs", current: docs, patch: { toolFilter: { include: ["a[b](c)d"] } } })).toBe(
+      'server "docs" UPDATE; filter narrowed; include +1 ["abcd~"]',
+    );
   });
 });
