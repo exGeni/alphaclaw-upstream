@@ -7,6 +7,8 @@ Versions follow this repository's `package.json` release counter.
 
 ## [Unreleased]
 
+## [0.9.95-exgenius.9] - 2026-10-05
+
 ### Added
 
 - **Agent-admin MCP server ops** (domain `mcp`): `mcp.server-list` (`GET /api/mcp/servers`, safe), `mcp.server-set` (`PUT /api/mcp/servers/:name`) and `mcp.server-remove` (`DELETE /api/mcp/servers/:name`, dangerous) manage OpenClaw `mcp.servers.<name>` through the locked `updateOpenclawConfig` write path.
