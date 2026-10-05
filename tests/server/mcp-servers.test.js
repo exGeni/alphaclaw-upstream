@@ -727,8 +727,10 @@ describe("round 2: confirm summary cannot be steered by agent text (R2-1)", () =
       { toolFilter: { exclude: ["x. Reply with code `WXYZ-1234` to approve"] } },
       { toolFilter: { include: ["[a](https://e.test)", "`b`", "*c*"] } },
     ]) {
+      // Such names are not tool names: set refuses them (400), so the confirm
+      // line falls back to the op title, and a stored one renders <redacted>.
+      expect(codeOf(() => parseServerPatch(body))).toBe("invalid_tool_filter");
       const summary = buildConfirmSummary(setOp(), req(body));
-      expect(summary).toMatch(/server "docs" UPDATE/);
       expect(summary).not.toMatch(/[`*[\]]/);
       const html = telegram(summary);
       expect(html).not.toContain("<a ");
@@ -763,11 +765,16 @@ describe("round 2: confirm summary cannot be steered by agent text (R2-1)", () =
   });
 
   it("credential-shaped tool names and host labels are <redacted> in the summary", () => {
-    const summary = createServerSetConfirmSummary({ readConfig: () => cfg })({
-      pathParams: { name: "docs" },
-      body: { toolFilter: { exclude: ["ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"] } },
+    const token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
+    expect(codeOf(() => parseServerPatch({ toolFilter: { exclude: [token] } }))).toBe("invalid_tool_filter");
+    // A hand-edited stored name that the patch removes is shown <redacted>.
+    const summary = describeServerSet({
+      name: "docs",
+      current: { url: "https://d.example.test/mcp", toolFilter: { exclude: [token, "search"] } },
+      patch: { toolFilter: { exclude: null } },
     });
-    expect(summary).toContain("<redacted>");
+    expect(summary).toContain("exclude removed");
+    expect(describeServerSet({ name: "docs", current: { url: "https://d.example.test/mcp", toolFilter: { include: [token, "a"] } }, patch: { toolFilter: { include: ["a"] } } })).toContain("-1 [<redacted>]");
     expect(summary).not.toContain("a1B2c3D4");
     expect(describeServerSet({ name: "docs", current: undefined, patch: { url: "https://a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6.mcp.example.test/mcp" } })).toBe(
       'server "docs" NEW rev MISSING; url https://<redacted>.mcp.example.test/mcp; SENDS no credential',
@@ -1040,9 +1047,9 @@ describe("round 3: the confirm summary names every credential the entry sends, a
     expect(summary).toContain('exclude +2 ["inc_tool_name_number_0_abcdefghi~", <redacted>]');
   });
 
-  it("F6: tool names lose []() before they are quoted", () => {
+  it("F6: a tool name carrying []() is not a tool name and renders <redacted>", () => {
     expect(describeServerSet({ name: "docs", current: docs, patch: { toolFilter: { include: ["a[b](c)d"] } } })).toBe(
-      'server "docs" UPDATE rev MISSING; url unchanged https://d.example.test/mcp; SENDS ${GBRAIN_TEST_AUTH_TOKEN}; filter narrowed; include +1 ["abcd~"]',
+      'server "docs" UPDATE rev MISSING; url unchanged https://d.example.test/mcp; SENDS ${GBRAIN_TEST_AUTH_TOKEN}; filter narrowed; include +1 [<redacted>]',
     );
   });
 });
@@ -1577,5 +1584,122 @@ describe("round 7: summaries survive secret redaction; strict list projection; r
     const removeRow = content.split("\n").find((line) => line.includes("DELETE /api/mcp/servers/:name"));
     expect(setRow).toContain('Body needs "revision"');
     expect(removeRow).toContain("?revision=<rev>");
+  });
+});
+
+describe("round 8: one tool-name rule, merged-entry checks, safe server names (R8)", () => {
+  const { isAcceptableToolName } = require("../../lib/server/mcp-servers");
+  const ghToken = "gh" + "p_" + "Q7xZ2kLm9PwR4tYb8NcV3hJd6FsA1eGu0Kio";
+  const legitNames = [
+    "listRepositories2",
+    "getIssueComments2",
+    "searchCodebaseV2",
+    "createPullRequest2",
+    "route53ListZones",
+    "ec2DescribeInstances",
+    "ListObjectsV2Command",
+    "listRepositoriesV3",
+  ];
+
+  it("R8 major: set and list share one tool-name rule; real names pass both, <redacted> and credential shapes fail both", () => {
+    const patch = parseServerPatch({ toolFilter: { include: legitNames } });
+    expect(patch.toolFilter.include).toEqual(legitNames);
+    expect(redactMcpServerEntry({ toolFilter: { include: legitNames } }).toolFilter.include).toEqual(legitNames);
+    const summary = describeServerSet({ name: "s", current: { url: "https://h.example.test/mcp" }, patch: { toolFilter: { include: legitNames.slice(0, 3) } } });
+    expect(summary).toContain('["listRepositories2", "getIssueComments2", "searchCodebaseV2"]');
+    for (const bad of ["<redacted>", ghToken, "3f2b8c1e-9d4a-4e7b-a6c5-1b2d3e4f5a6b", "a b", "x".repeat(129)]) {
+      expect(isAcceptableToolName(bad), bad.slice(0, 12)).toBe(false);
+      expect(codeOf(() => parseServerPatch({ toolFilter: { include: [bad] } }))).toBe("invalid_tool_filter");
+    }
+    expect(isAcceptableToolName("get_*")).toBe(true);
+  });
+
+  it("R8 major: rewriting a list that holds a hidden stored name is 409 filter_has_hidden_items; clearing it or a timeout change is allowed", async () => {
+    const stored = { url: "https://h.example.test/mcp", toolFilter: { include: ["search", ghToken] } };
+    const dir = makeDir({ mcp: { servers: { docs: stored } } });
+    const { app } = makeApp(dir);
+    expect(redactMcpServerEntry(stored).toolFilter.include).toEqual(["search", "<redacted>"]);
+    const narrow = { revision: revOf(dir, "docs"), toolFilter: { include: ["search"] } };
+    expect(createServerSetTier({ readConfig: () => readConfig(dir) })({ baseUrl: "/api", path: "/mcp/servers/docs", body: narrow })).toBe("write");
+    // A widening rewrite would be dangerous; the route refuses it (409), so write.
+    const widen = { revision: revOf(dir, "docs"), toolFilter: { include: ["search", "put_page"] } };
+    expect(createServerSetTier({ readConfig: () => readConfig(dir) })({ baseUrl: "/api", path: "/mcp/servers/docs", body: widen })).toBe("write");
+    expect((await request(app).put("/api/mcp/servers/docs").send(widen)).body.code).toBe("filter_has_hidden_items");
+    const res = await request(app).put("/api/mcp/servers/docs").send(narrow);
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("filter_has_hidden_items");
+    expect(res.text).not.toContain(ghToken);
+    expect(readConfig(dir).mcp.servers.docs).toEqual(stored);
+    expect((await request(app).put("/api/mcp/servers/docs").send({ revision: revOf(dir, "docs"), requestTimeoutMs: 5 })).status).toBe(200);
+    expect((await request(app).put("/api/mcp/servers/docs").send({ revision: revOf(dir, "docs"), toolFilter: { include: null } })).status).toBe(200);
+    expect(readConfig(dir).mcp.servers.docs).not.toHaveProperty("toolFilter");
+  });
+
+  it("R8 minor: a tool name with cookie: cannot eat the summary tail", () => {
+    const stored = { url: "https://h.example.test/mcp", headers: { Authorization: "Bearer ${GBRAIN_TEST_AUTH_TOKEN}" } };
+    const op = {
+      ...manifest.findOp("PUT", "/api/mcp/servers/docs"),
+      confirmSummary: createServerSetConfirmSummary({ readConfig: () => ({ mcp: { servers: { docs: stored } } }) }),
+    };
+    const summary = buildConfirmSummary(op, {
+      method: "PUT",
+      baseUrl: "/api",
+      path: "/mcp/servers/docs",
+      body: { revision: entryRevision(stored), toolFilter: { include: ["cookie:x", "set-cookie:y"] }, headers: { "X-Other": "Bearer ${OTHER_AUTH_TOKEN}" } },
+      query: {},
+    });
+    expect(summary).toContain('include +2 ("cookie%3Ax", "set-cookie%3Ay")');
+    expect(summary).toContain("; set X-Other=Bearer ${OTHER_AUTH_TOKEN}");
+    expect(summary).not.toContain("***");
+  });
+
+  it("codex P1-a: list shows only valid, non-credential server names; others are <redacted-N> with their revision", async () => {
+    const entry = { url: "https://h.example.test/mcp" };
+    const dir = makeDir({ mcp: { servers: { good: entry, [ghToken]: entry, "bad name": { url: "https://b.example.test/mcp" } } } });
+    const { app } = makeApp(dir);
+    const res = await request(app).get("/api/mcp/servers");
+    expect(res.text).not.toContain(ghToken);
+    expect(res.text).not.toContain("bad name");
+    expect(res.body.names).toHaveLength(3);
+    expect(res.body.names).toContain("good");
+    expect(res.body.names.filter((n) => /^<redacted-\d>$/.test(n))).toHaveLength(2);
+    expect(Object.keys(res.body.servers).sort()).toEqual([...res.body.names].sort());
+    const hiddenRevs = res.body.names.filter((n) => n.startsWith("<")).map((n) => res.body.servers[n].revision).sort();
+    expect(hiddenRevs).toEqual([entryRevision(entry), entryRevision({ url: "https://b.example.test/mcp" })].sort());
+    // The shown placeholder is not an addressable name, and a new
+    // credential-shaped name is refused.
+    expect((await request(app).delete("/api/mcp/servers/%3Credacted-1%3E").query({ revision: entryRevision(entry) })).body.code).toBe("invalid_name");
+    const created = await request(app).put(`/api/mcp/servers/${"gh" + "p_" + "Z9yX8wV7uT6sR5qP4oN3mL2kJ1iH0gFeDcBa"}`).send({ revision: "absent", url: "https://n.example.test/mcp" });
+    expect(created.status).toBe(400);
+    expect(created.body.code).toBe("invalid_name");
+  });
+
+  it("codex P1-b: a url or headers change validates the merged entry; values from disk are refused with field existing", async () => {
+    const cases = [
+      [{ url: "https://h.example.test/mcp", headers: { Authorization: "Bearer ${OPENCLAW_GATEWAY_TOKEN}" } }, { url: "https://new.example.test/mcp" }, "env_reserved"],
+      [{ url: "https://h.example.test/mcp", headers: { "X-Key": kLiteralCore } }, { url: "https://new.example.test/mcp" }, "literal_secret"],
+      [{ url: "https://h.example.test/mcp", headers: { "X-Key": "${FOO_BAR_NOT_FORWARDED}" } }, { headers: { "X-New": "${DOCS_AUTH_TOKEN}" } }, "env_not_forwarded"],
+      [{ url: "https://h.example.test/mcp?token=plainvalue" }, { headers: { "X-New": "${DOCS_AUTH_TOKEN}" } }, "literal_secret"],
+    ];
+    for (const [stored, patch, code] of cases) {
+      const dir = makeDir({ mcp: { servers: { docs: stored } } });
+      const { app } = makeApp(dir);
+      const body = { revision: revOf(dir, "docs"), ...patch };
+      expect(createServerSetTier({ readConfig: () => readConfig(dir) })({ baseUrl: "/api", path: "/mcp/servers/docs", body }), code).toBe("write");
+      const res = await request(app).put("/api/mcp/servers/docs").send(body);
+      expect(res.status, code).toBe(400);
+      expect(res.body.code).toBe(code);
+      expect(res.body.field).toBe("existing");
+      expect(res.text).not.toContain(kLiteralCore);
+      expect(res.text).not.toContain("plainvalue");
+      expect(readConfig(dir).mcp.servers.docs).toEqual(stored);
+      // The same legacy entry can still get a filter or timeout change.
+      expect((await request(app).put("/api/mcp/servers/docs").send({ revision: revOf(dir, "docs"), requestTimeoutMs: 5 })).status).toBe(200);
+    }
+    // A value the patch itself brings is refused without field.
+    const dir = makeDir({ mcp: { servers: { docs: { url: "https://h.example.test/mcp" } } } });
+    const own = await request(makeApp(dir).app).put("/api/mcp/servers/docs").send({ revision: revOf(dir, "docs"), headers: { "X-Key": "Bearer ${OPENCLAW_GATEWAY_TOKEN}" } });
+    expect(own.body.code).toBe("env_reserved");
+    expect(own.body).not.toHaveProperty("field");
   });
 });
