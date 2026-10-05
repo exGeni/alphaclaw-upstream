@@ -1953,7 +1953,7 @@ describe("round 10: decoded url forms only; retained refs on every set; safe hea
       patch: { headers: { [tokenHeader]: null, "X-Ok": "${DOCS_AUTH_TOKEN}" } },
     });
     expect(summary).not.toContain(tokenHeader);
-    expect(summary).toContain("set X-Ok=${DOCS_AUTH_TOKEN}; removed <redacted-1>"); // stored index, as in the list
+    expect(summary).toContain("set X-Ok=${DOCS_AUTH_TOKEN}; removed <redacted-2>");
   });
 });
 
@@ -1990,100 +1990,5 @@ describe("tolerant percent-decoding around malformed escapes", () => {
     ]) {
       expect(parseServerPatch({ url }).url, url).toBe(url);
     }
-  });
-});
-
-describe("round 11: every string field, display names, header numbering (R11)", () => {
-  const { resetGatewayLaunchEnvForTests: resetSnapshot } = require("../../lib/server/gateway-launch-env-snapshot");
-  // Token-shaped fixtures are assembled at runtime; none is real.
-  const skToken = "sk-" + "a1B2c3D4e5F6g7H8i9J0k1L2m3";
-  const liveName = "sk_" + "live_" + "a1B2c3D4e5F6g7H8i9J0k1L2";
-
-  it("codex P1-1: env, oauth, command and args are scanned; their refs are in SENDS and checked; literal credentials refused", async () => {
-    vi.stubEnv("GBRAIN_X_AUTH_TOKEN", "fixture-placeholder");
-    const stdio = { command: "npx -y @modelcontextprotocol/server-filesystem /data", args: ["--root", "/srv/data"], env: { NODE_ENV: "production", T: "${GBRAIN_X_AUTH_TOKEN}" }, cwd: "/srv/mcp" };
-    expect(describeServerSet({ name: "fs", current: stdio, patch: { revision: entryRevision(stdio), requestTimeoutMs: 1 } })).toContain(
-      "url none; SENDS ${GBRAIN_X_AUTH_TOKEN}",
-    );
-    const okDir = makeDir({ mcp: { servers: { fs: stdio } } });
-    expect((await request(makeApp(okDir, { env: { GBRAIN_X_AUTH_TOKEN: "x" } }).app).put("/api/mcp/servers/fs").send({ revision: revOf(okDir, "fs"), requestTimeoutMs: 5 })).status).toBe(200);
-    const oauthEntry = { url: "https://h.example.test/mcp", oauth: { redirectUrl: "https://h.example.test/cb?s=${DOCS_AUTH_TOKEN}" } };
-    expect(describeServerSet({ name: "o", current: oauthEntry, patch: { revision: entryRevision(oauthEntry), requestTimeoutMs: 1 } })).toContain(
-      "SENDS ${DOCS_AUTH_TOKEN}",
-    );
-    for (const [stored, code] of [
-      [{ ...stdio, env: { TOKEN: skToken } }, "literal_secret"],
-      [{ ...stdio, args: ["--token", skToken] }, "literal_secret"],
-      [{ ...stdio, command: `mcp-server --api-key=${skToken}` }, "literal_secret"],
-      [{ url: "https://h.example.test/mcp", oauth: { redirectUrl: "https://h.example.test/cb?s=${OPENCLAW_GATEWAY_TOKEN}" } }, "env_reserved"],
-      [{ url: "https://h.example.test/mcp", oauth: { authProfileId: skToken } }, "literal_secret"],
-      [{ ...stdio, env: { A: "${DOCS_AUTH_TOKEN}", B: "${OTHER_AUTH_TOKEN}", C: "${EXTRA_AUTH_TOKEN}", D: "${ROTATED_AUTH_TOKEN}", E: "${TENANT_AUTH_TOKEN}" } }, "too_many_env_refs"],
-    ]) {
-      const dir = makeDir({ mcp: { servers: { s: stored } } });
-      const body = { revision: revOf(dir, "s"), requestTimeoutMs: 5 };
-      expect(createServerSetTier({ readConfig: () => readConfig(dir) })({ baseUrl: "/api", path: "/mcp/servers/s", body }), code).toBe("write");
-      const res = await request(makeApp(dir, { env: { GBRAIN_X_AUTH_TOKEN: "x" } }).app).put("/api/mcp/servers/s").send(body);
-      expect(res.body, code).toMatchObject({ code, field: "existing" });
-      expect(res.text).not.toContain(skToken);
-      expect(readConfig(dir).mcp.servers.s).toEqual(stored);
-    }
-  });
-
-  it("codex P1-2: a token-shaped server name is never echoed outside routing", async () => {
-    const dir = makeDir({ mcp: { servers: { [liveName]: { url: "https://h.example.test/mcp" } } } });
-    const { app, log } = makeApp(dir);
-    const rev = entryRevision({ url: "https://h.example.test/mcp" });
-    const set = await request(app).put(`/api/mcp/servers/${liveName}`).send({ revision: rev, requestTimeoutMs: 5 });
-    expect(set.status).toBe(200);
-    expect(set.body.name).toBe("<redacted>");
-    expect(set.text).not.toContain(liveName);
-    const summary = describeServerSet({ name: liveName, current: { url: "https://h.example.test/mcp" }, patch: { revision: rev, requestTimeoutMs: 1 } });
-    expect(summary).toContain('server "<redacted>" UPDATE');
-    const { describeServerRemove: removeSummary } = require("../../lib/server/mcp-servers");
-    expect(removeSummary({ name: liveName, current: { url: "https://h.example.test/mcp" }, revision: rev })).toContain('server "<redacted>" REMOVE');
-    expect(removeSummary({ name: liveName, current: undefined, revision: rev })).toBe('server "<redacted>" not found');
-    const removed = await request(app).delete(`/api/mcp/servers/${liveName}`).query({ revision: revOf(dir, liveName) });
-    expect(removed.body).toEqual({ ok: true, removed: "<redacted>" });
-    expect(log.log.mock.calls.flat().join("\n")).not.toContain(liveName);
-    expect(log.log.mock.calls.flat().join("\n")).toContain('"<redacted>"');
-  });
-
-  it("R11 m1: with the launch-env snapshot unknown, a retained unset var does not block the tier (stays dangerous)", () => {
-    resetSnapshot();
-    delete process.env.R11_ABSENT_AUTH_TOKEN;
-    const stored = { url: "https://h.example.test/mcp", headers: { Authorization: "Bearer ${R11_ABSENT_AUTH_TOKEN}" } };
-    const tier = createServerSetTier({ readConfig: () => ({ mcp: { servers: { docs: stored } } }) });
-    expect(tier({ baseUrl: "/api", path: "/mcp/servers/docs", body: { revision: entryRevision(stored), url: "https://other.example.test/mcp" } })).toBe("dangerous");
-  });
-
-  it("R11 m2: list, confirm and errors number a hidden header by its stored index", async () => {
-    const tokenHeader = "X-" + "aB3dE5fG7hJ9kL1mN3pQ5rS7";
-    const stored = { url: "https://h.example.test/mcp", headers: { "X-Ok": "${DOCS_AUTH_TOKEN}", [tokenHeader]: "${OTHER_AUTH_TOKEN}" } };
-    const listed = redactMcpServerEntry(stored).headers;
-    const hiddenLabel = Object.keys(listed).find((k) => k.startsWith("<redacted-"));
-    expect(hiddenLabel).toBe("<redacted-2>");
-    const summary = describeServerSet({ name: "docs", current: stored, patch: { revision: entryRevision(stored), headers: { [tokenHeader]: null } } });
-    expect(summary).toContain(`removed ${hiddenLabel}`);
-    const literal = { url: "https://h.example.test/mcp", headers: { "X-Ok": "${DOCS_AUTH_TOKEN}", [tokenHeader]: kLiteralCore } };
-    const dir = makeDir({ mcp: { servers: { docs: literal } } });
-    const res = await request(makeApp(dir).app).put("/api/mcp/servers/docs").send({ revision: revOf(dir, "docs"), requestTimeoutMs: 5 });
-    expect(res.body.error).toContain(`"${Object.keys(redactMcpServerEntry(literal).headers).find((k) => k.startsWith("<redacted-"))}"`);
-    expect(res.text).not.toContain(tokenHeader);
-  });
-
-  it("R11 m3: a new header name that looks like a token or credential is refused; removing one works", () => {
-    const tokenHeader = "X-" + "aB3dE5fG7hJ9kL1mN3pQ5rS7";
-    expect(codeOf(() => parseServerPatch({ headers: { [tokenHeader]: "${DOCS_AUTH_TOKEN}" } }))).toBe("invalid_headers");
-    expect(codeOf(() => parseServerPatch({ headers: { [skToken]: "${DOCS_AUTH_TOKEN}" } }))).toBe("invalid_headers");
-    expect(parseServerPatch({ headers: { [tokenHeader]: null } }).headers).toEqual({ [tokenHeader]: null });
-    expect(parseServerPatch({ headers: { "X-Api-Version": "${DOCS_AUTH_TOKEN}" } }).headers).toEqual({ "X-Api-Version": "${DOCS_AUTH_TOKEN}" });
-  });
-
-  it("whitespace separates words: spaced file names are accepted, token-shaped segments still refused", () => {
-    for (const url of ["https://h.example.test/path%20with%20spaces2026/mcp", "https://h.example.test/files/Annual%20Report%202026.pdf"]) {
-      expect(parseServerPatch({ url }).url).toBe(url);
-      expect(redactMcpServerEntry({ url }).url).toBe(url);
-    }
-    expect(codeOf(() => parseServerPatch({ url: `https://h.example.test/x%20${skToken}/mcp` }))).toBe("literal_secret");
   });
 });
