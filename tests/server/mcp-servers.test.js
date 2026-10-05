@@ -1825,3 +1825,49 @@ describe("round 9: token-shape names, bounds on every set, repeated decoding (R9
     expect(parseServerPatch({ url: "https://h.example.test/my%2520docs/mcp" }).url).toBe("https://h.example.test/my%2520docs/mcp");
   });
 });
+
+describe("url components encoded deeper than three levels", () => {
+  const { encodedTooDeep } = require("../../lib/server/mcp-servers");
+  const enc = (text, times) => {
+    let out = text.replace(/^s/, "%73");
+    for (let i = 1; i < times; i += 1) out = out.replace(/%/g, "%25");
+    return out;
+  };
+  // Low-entropy fixture; not a real token.
+  const token = "sk_" + "abcdefghijklmnop";
+
+  it("refuses a 4x-encoded component (400 invalid_url) and hides it when stored; 3 levels and malformed % stay as before", () => {
+    const four = enc(token, 4);
+    expect(encodedTooDeep(four)).toBe(true);
+    expect(encodedTooDeep(enc(token, 3))).toBe(false);
+    for (const url of [
+      `https://h.example.test/${four}/mcp`,
+      `https://h.example.test/mcp?${four}=1`,
+      `https://h.example.test/mcp?q=${four}`,
+      `https://h.example.test/mcp;${four}=1`,
+      `https://h.example.test/mcp;k=${four}`,
+    ]) {
+      let error;
+      try {
+        parseServerPatch({ url });
+      } catch (err) {
+        error = err;
+      }
+      expect(error?.code, url).toBe("invalid_url");
+      expect(error.hint).toBe("percent-encoded more than 3 levels");
+      const shown = redactMcpServerEntry({ url }).url;
+      expect(shown, url).not.toContain("abcdefgh");
+      expect(shown).not.toContain(four);
+      expect(describeServerSet({ name: "s", current: { url }, patch: { revision: entryRevision({ url }), requestTimeoutMs: 1 } })).not.toContain("abcdefgh");
+    }
+    // Deeper still: a stored 5x-encoded query key is hidden by the depth rule
+    // alone (the credential check stops at three levels).
+    const fiveKey = `https://h.example.test/mcp?${enc(token, 5)}=1`;
+    expect(redactMcpServerEntry({ url: fiveKey }).url).toBe("https://h.example.test/mcp?<redacted>=<redacted>");
+    expect(codeOf(() => parseServerPatch({ url: `https://h.example.test/${enc(token, 3)}/mcp` }))).toBe("literal_secret");
+    for (const url of ["https://h.example.test/a%ZZb/mcp", "https://h.example.test/my%2520docs/mcp"]) {
+      expect(parseServerPatch({ url }).url).toBe(url);
+    }
+    expect(redactMcpServerEntry({ url: "https://h.example.test/my%2520docs/mcp" }).url).toBe("https://h.example.test/my%2520docs/mcp");
+  });
+});
