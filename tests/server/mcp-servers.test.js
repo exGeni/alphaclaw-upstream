@@ -1693,8 +1693,10 @@ describe("round 8: one tool-name rule, merged-entry checks, safe server names (R
       expect(res.text).not.toContain(kLiteralCore);
       expect(res.text).not.toContain("plainvalue");
       expect(readConfig(dir).mcp.servers.docs).toEqual(stored);
-      // The same legacy entry can still get a filter or timeout change.
-      expect((await request(app).put("/api/mcp/servers/docs").send({ revision: revOf(dir, "docs"), requestTimeoutMs: 5 })).status).toBe(200);
+      // Round 10: the merged check runs on every set, so a timeout change on
+      // the same entry is refused too (same code, field existing).
+      const timeout = await request(app).put("/api/mcp/servers/docs").send({ revision: revOf(dir, "docs"), requestTimeoutMs: 5 });
+      expect(timeout.body).toMatchObject({ code, field: "existing" });
     }
     // A value the patch itself brings is refused without field.
     const dir = makeDir({ mcp: { servers: { docs: { url: "https://h.example.test/mcp" } } } });
@@ -1869,5 +1871,88 @@ describe("url components encoded deeper than three levels", () => {
       expect(parseServerPatch({ url }).url).toBe(url);
     }
     expect(redactMcpServerEntry({ url: "https://h.example.test/my%2520docs/mcp" }).url).toBe("https://h.example.test/my%2520docs/mcp");
+  });
+});
+
+describe("round 10: decoded url forms only; retained refs on every set; safe header names in errors (R10)", () => {
+  const { looksLikeTokenName, assertMergedEntryValid } = require("../../lib/server/mcp-servers");
+
+  it("R10 major: an ordinary percent-encoded path is judged by its decoded text only", () => {
+    for (const url of ["https://example.com/files/report%202026%20Q3.pdf", "https://example.com/my%20docs%202026/mcp"]) {
+      expect(parseServerPatch({ url }).url).toBe(url);
+      expect(redactMcpServerEntry({ url }).url).toBe(url);
+    }
+    // Raw-form skipping, pinned: this raw text is flagged on its own (whole
+    // string, high entropy of the %XX runs) while its decoded text is not.
+    const raw = "report%202026%20Q3.pdf";
+    expect(looksLikeCredential(raw)).toBe(true);
+    expect(looksLikeCredential(decodeURIComponent(raw))).toBe(false);
+    expect(parseServerPatch({ url: `https://example.com/${raw}/mcp` }).url).toBe(`https://example.com/${raw}/mcp`);
+    // An encoded token is still refused through its decoded form.
+    const tokenEnc = ("sk_" + "live_" + "Ab12Cd34Ef56Gh78Ij90Kl12").split("").map((c) => `%${c.charCodeAt(0).toString(16)}`).join("");
+    expect(codeOf(() => parseServerPatch({ url: `https://example.com/${tokenEnc}/mcp` }))).toBe("literal_secret");
+  });
+
+  it("R10 m2+m3: gbrain_ and pa- are token prefixes, and the body threshold is 20", () => {
+    for (const token of ["gbrain_" + "a1B2c3D4e5F6g7H8i9J0k1", "pa-" + "a1B2c3D4e5F6g7H8i9J0k1"]) {
+      expect(looksLikeTokenName(token)).toBe(true);
+      expect(codeOf(() => parseServerPatch({ toolFilter: { include: [token] } }))).toBe("invalid_tool_filter");
+    }
+    for (const name of ["sk_" + "a1b2c3d4e5f6g7h8i9", "gbrain_" + "abcdefghij", "pa-" + "abcdefghijklmno"]) {
+      expect(looksLikeTokenName(name), name).toBe(false);
+      expect(parseServerPatch({ toolFilter: { include: [name] } }).toolFilter.include).toEqual([name]);
+    }
+    expect(looksLikeTokenName("sk_" + "a1b2c3d4e5f6g7h8i9j0")).toBe(true);
+  });
+
+  it("codex P1-1: a stored bad header blocks every change except one that removes it", async () => {
+    const stored = { url: "https://h.example.test/mcp", headers: { Authorization: "Bearer ${OPENCLAW_GATEWAY_TOKEN}" }, toolFilter: { include: ["a", "b"] } };
+    const dir = makeDir({ mcp: { servers: { docs: stored } } });
+    const { app } = makeApp(dir);
+    for (const patch of [{ requestTimeoutMs: 5 }, { toolFilter: { include: ["a"] } }, { transport: "sse" }]) {
+      const body = { revision: revOf(dir, "docs"), ...patch };
+      expect(createServerSetTier({ readConfig: () => readConfig(dir) })({ baseUrl: "/api", path: "/mcp/servers/docs", body })).toBe("write");
+      const res = await request(app).put("/api/mcp/servers/docs").send(body);
+      expect(res.body).toMatchObject({ code: "env_reserved", field: "existing" });
+    }
+    expect(readConfig(dir).mcp.servers.docs).toEqual(stored);
+    const fix = await request(app).put("/api/mcp/servers/docs").send({ revision: revOf(dir, "docs"), headers: { Authorization: null } });
+    expect(fix.status).toBe(200);
+  });
+
+  it("codex P1-2: a retained reference is checked against the env like a patch reference, except env_not_set with the launch env unknown", async () => {
+    const stored = { url: "https://h.example.test/mcp", headers: { Authorization: "Bearer ${UNSET_RETAINED_AUTH_TOKEN}" } };
+    // Launch env known: an unset retained var is env_not_set, field existing.
+    const known = makeDir({ mcp: { servers: { docs: stored } } });
+    const knownApp = makeApp(known, { getLaunchedEnvKeys: () => new Set(["PATH"]) }).app;
+    const refused = await request(knownApp).put("/api/mcp/servers/docs").send({ revision: revOf(known, "docs"), requestTimeoutMs: 5 });
+    expect(refused.body).toMatchObject({ code: "env_not_set", field: "existing" });
+    // Launch env unknown: not refused for env_not_set; the response says so.
+    const unknown = makeDir({ mcp: { servers: { docs: stored } } });
+    const unknownApp = makeApp(unknown, { getLaunchedEnvKeys: () => null }).app;
+    const passed = await request(unknownApp).put("/api/mcp/servers/docs").send({ revision: revOf(unknown, "docs"), requestTimeoutMs: 5 });
+    expect(passed.status).toBe(200);
+    expect(passed.body.launchEnvUnknown).toBe(true);
+    // A retained var that is not forwarded is refused either way.
+    expect(() =>
+      assertMergedEntryValid({ url: "https://h.example.test/mcp", headers: { A: "${FOO_NOT_FORWARDED}" } }, { requestTimeoutMs: 1 }, { launchEnvKnown: false }),
+    ).toThrow(expect.objectContaining({ code: "env_not_forwarded", field: "existing" }));
+  });
+
+  it("codex P1-3: errors and confirm detail never echo an unsafe stored header name", async () => {
+    const tokenHeader = "sk-" + "a1B2c3D4e5F6g7H8i9J0k1L2m3";
+    const dir = makeDir({ mcp: { servers: { docs: { url: "https://h.example.test/mcp", headers: { [tokenHeader]: kLiteralCore } } } } });
+    const res = await request(makeApp(dir).app).put("/api/mcp/servers/docs").send({ revision: revOf(dir, "docs"), requestTimeoutMs: 5 });
+    expect(res.body).toMatchObject({ code: "literal_secret", field: "existing" });
+    expect(res.text).not.toContain(tokenHeader);
+    expect(res.text).not.toContain(kLiteralCore);
+    expect(res.body.error).toContain('"<redacted-1>"');
+    const summary = describeServerSet({
+      name: "docs",
+      current: { url: "https://h.example.test/mcp", headers: { [tokenHeader]: "${DOCS_AUTH_TOKEN}" } },
+      patch: { headers: { [tokenHeader]: null, "X-Ok": "${DOCS_AUTH_TOKEN}" } },
+    });
+    expect(summary).not.toContain(tokenHeader);
+    expect(summary).toContain("set X-Ok=${DOCS_AUTH_TOKEN}; removed <redacted-2>");
   });
 });
