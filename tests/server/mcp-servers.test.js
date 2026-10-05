@@ -1956,3 +1956,39 @@ describe("round 10: decoded url forms only; retained refs on every set; safe hea
     expect(summary).toContain("set X-Ok=${DOCS_AUTH_TOKEN}; removed <redacted-2>");
   });
 });
+
+describe("tolerant percent-decoding around malformed escapes", () => {
+  const { safeDecode, encodedTooDeep } = require("../../lib/server/mcp-servers");
+
+  it("decodes every valid escape, keeps malformed % and invalid UTF-8 bytes as they are", () => {
+    expect(safeDecode("%61%70%69%5F%6B%65%79%ZZ")).toBe("api_key%ZZ");
+    expect(safeDecode("a%ZZb")).toBe("a%ZZb");
+    expect(safeDecode("%E2%82%AC%ZZ")).toBe("€%ZZ");
+    expect(safeDecode("%F0%9F%98%80x%Z")).toBe("\u{1F600}x%Z");
+    expect(safeDecode("%61%FF%62%")).toBe("a%FFb%");
+    expect(safeDecode("%E2%82")).toBe("%E2%82");
+    expect(encodedTooDeep("a%ZZb")).toBe(false);
+  });
+
+  it("a sensitive key hidden behind a malformed escape is judged like the plain key", () => {
+    expect(codeOf(() => parseServerPatch({ url: "https://example.com/mcp?api_key=v" }))).toBe("literal_secret");
+    expect(codeOf(() => parseServerPatch({ url: "https://example.com/mcp?%61%70%69%5F%6B%65%79%ZZ=v" }))).toBe("literal_secret");
+    // A token prefix hidden by one escape next to a malformed one, in a path
+    // segment (no URLSearchParams decoding there): only the tolerant decoder
+    // sees "sk_".
+    const hidden = "%73k_" + "abcdefghijklmnop" + "%ZZ";
+    expect(looksLikeCredential(hidden)).toBe(false);
+    expect(codeOf(() => parseServerPatch({ url: `https://example.com/${hidden}/mcp` }))).toBe("literal_secret");
+    expect(redactMcpServerEntry({ url: `https://example.com/${hidden}/mcp` }).url).toBe("https://example.com/<redacted>/mcp");
+    for (const url of [
+      "https://h.example.test/a%ZZb/mcp",
+      "https://h.example.test/my%2520docs/mcp",
+      "https://example.com/files/report%202026%20Q3.pdf",
+      "https://example.com/%E2%82%AC/mcp",
+      "https://example.com/mcp?u=%F0%9F%98%80",
+      "https://example.com/%E2%82%25/mcp",
+    ]) {
+      expect(parseServerPatch({ url }).url, url).toBe(url);
+    }
+  });
+});
