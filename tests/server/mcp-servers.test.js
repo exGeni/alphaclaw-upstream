@@ -13,6 +13,7 @@ const {
   parseServerPatch,
   isToolFilterNarrowing,
   describeServerSet,
+  applyServerPatch,
   createMcpServersService,
 } = require("../../lib/server/mcp-servers");
 const { classifyGatewayEnvKey } = require("../../lib/server/gateway-env-policy");
@@ -928,12 +929,13 @@ describe("round 3: the confirm summary names every credential the entry sends, a
   });
 
   it("F2: the worst-case critical part fits the 400-character clamp with every reference named", () => {
+    // Worst case under the header caps (32 per call and per entry).
     const refs = [0, 1, 2, 3].map((i) => `R${i}_X_AUTH_TOKEN`);
     for (const ref of refs) vi.stubEnv(ref, "fixture-placeholder");
     const name = "n".repeat(64);
-    const literal = Object.fromEntries(Array.from({ length: 999 }, (_, i) => [`L-${i}`, "plain"]));
+    const literal = Object.fromEntries(Array.from({ length: 28 }, (_, i) => [`L-${i}`, "plain"]));
     const headers = Object.fromEntries(refs.map((r, i) => [`X-${i}`, `\${${r}}`]));
-    for (let i = 0; i < 999; i += 1) headers[`Y-${i}`] = null;
+    for (let i = 0; i < 28; i += 1) headers[`Y-${i}`] = null;
     const host = `${Array.from({ length: 12 }, () => "mcpserver").join(".")}.com`;
     const summary = summaryFor(
       {
@@ -948,7 +950,9 @@ describe("round 3: the confirm summary names every credential the entry sends, a
     expect(summary.length).toBeLessThanOrEqual(400);
     expect(summary.endsWith("…")).toBe(false);
     for (const ref of refs) expect(summary).toContain(`\${${ref}}`);
-    expect(summary).toContain("999 literal headers; transport streamable-http; FILTER WIDENED; GLOB IN FILTER; headers set 4, removed 999");
+    const critical = summary.slice(0, summary.indexOf("headers set 4, removed 28") + "headers set 4, removed 28".length);
+    expect(critical).toContain("28 literal headers; transport streamable-http; FILTER WIDENED; GLOB IN FILTER; headers set 4, removed 28");
+    expect(critical.length).toBe(387); // measured bound, stated in mcp-servers.js
   });
 
   it("F3: an idempotent retry still reports restartRequired for a var the running gateway lacks", () => {
@@ -992,6 +996,113 @@ describe("round 3: the confirm summary names every credential the entry sends, a
   it("F6: tool names lose []() before they are quoted", () => {
     expect(describeServerSet({ name: "docs", current: docs, patch: { toolFilter: { include: ["a[b](c)d"] } } })).toBe(
       'server "docs" UPDATE; filter narrowed; include +1 ["abcd~"]',
+    );
+  });
+});
+
+describe("round 4: url keys, registrable label, header caps, host escaping, unknown launch env (R4)", () => {
+  // Credential-shaped fixtures are assembled at runtime; they are not real credentials.
+  const tokenShape = "gh" + "p_" + "Q7xZ2kLm9PwR4tYb8NcV3hJd6FsA1eGu0Kio";
+  const uuidShape = "3f2b8c1e-9d4a-4e7b-a6c5-1b2d3e4f5a6b";
+  const docs = { url: "https://d.example.test/mcp" };
+  const tierFor = (body, current = docs) =>
+    createServerSetTier({ readConfig: () => ({ mcp: { servers: current ? { docs: current } : {} } }) })({
+      baseUrl: "/api",
+      path: "/mcp/servers/docs",
+      body,
+    });
+  const manyHeaders = (n, prefix = "X") =>
+    Object.fromEntries(Array.from({ length: n }, (_, i) => [`${prefix}-${i}`, "Bearer ${DOCS_AUTH_TOKEN}"]));
+
+  it("R4-1: refuses a credential-shaped query or ;matrix key and redacts one already on disk", () => {
+    for (const url of [
+      `https://api.example.test/mcp?${tokenShape}`,
+      `https://api.example.test/mcp?${tokenShape}=`,
+      `https://api.example.test/mcp;${tokenShape}`,
+      `https://api.example.test/mcp;${tokenShape}=1`,
+      `https://api.example.test/mcp?${uuidShape}`,
+    ]) {
+      expect(codeOf(() => parseServerPatch({ url })), "url shape").toBe("literal_secret");
+      expect(redactMcpServerEntry({ url }).url).not.toContain(tokenShape);
+      expect(redactMcpServerEntry({ url }).url).not.toContain(uuidShape);
+    }
+    expect(parseServerPatch({ url: "https://api.example.test/mcp?page=2;v=1" }).url).toBe("https://api.example.test/mcp?page=2;v=1");
+  });
+
+  it("R4-2: keeps the registrable label, cut inside from its left, and the TLD", () => {
+    const one = `${"mcp-".repeat(20)}mcp.com`;
+    const two = `api.${"exgenius-".repeat(8)}host.net`;
+    expect(describeServerSet({ name: "s", current: undefined, patch: { url: `https://${one}/mcp` } })).toBe(
+      'server "s" NEW; url https://~mcp-mcp-mcp-mcp-mcp-mcp-mcp-mcp-mcp.com/mcp; SENDS no credential',
+    );
+    expect(describeServerSet({ name: "s", current: undefined, patch: { url: `https://${two}/mcp` } })).toBe(
+      'server "s" NEW; url https://~ius-exgenius-exgenius-exgenius-host.net/mcp; SENDS no credential',
+    );
+  });
+
+  it("R4-3: caps headers per call and per resulting entry before any merge, and merges case-insensitively", async () => {
+    expect(codeOf(() => parseServerPatch({ headers: manyHeaders(33) }))).toBe("too_many_headers");
+    expect(Object.keys(parseServerPatch({ headers: manyHeaders(32) }).headers)).toHaveLength(32);
+    const current = { url: "https://d.example.test/mcp", headers: manyHeaders(31, "Old") };
+    const dir = makeDir({ mcp: { servers: { docs: current } } });
+    const res = await request(makeApp(dir).app).put("/api/mcp/servers/docs").send({ headers: manyHeaders(2) });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("too_many_headers");
+    expect(readConfig(dir).mcp.servers.docs).toEqual(current);
+    expect(tierFor({ headers: manyHeaders(33) })).toBe("write");
+    expect(tierFor({ headers: manyHeaders(2) }, current)).toBe("write");
+    const merged = applyServerPatch(
+      { headers: { Authorization: "Bearer ${DOCS_AUTH_TOKEN}", "X-Keep": "${OTHER_AUTH_TOKEN}" } },
+      { headers: { authorization: "Bearer ${EXTRA_AUTH_TOKEN}", "x-keep": null } },
+    );
+    expect(merged.headers).toEqual({ authorization: "Bearer ${EXTRA_AUTH_TOKEN}" });
+  });
+
+  it("R4-4: renders IPv6 literals in brackets and escapes, never drops, odd host characters", () => {
+    expect(describeServerSet({ name: "s", current: undefined, patch: { url: "http://[::1]:3131/mcp" } })).toBe(
+      'server "s" NEW; url http://[::1]:3131/mcp; SENDS no credential',
+    );
+    expect(describeServerSet({ name: "s", current: undefined, patch: { url: "https://trusted!.example.test/mcp" } })).toContain(
+      "url https://trusted%21.example.test/mcp",
+    );
+    expect(describeServerSet({ name: "s", current: undefined, patch: { url: "https://ex_genius.example.test/mcp" } })).toContain(
+      "url https://ex_genius.example.test/mcp",
+    );
+  });
+
+  it("R4-5: with an unknown launch env, only a changing call with references asks for a restart", () => {
+    const dir = makeDir({ mcp: { servers: {} } });
+    const svc = createMcpServersService({
+      fsModule: fs,
+      openclawDir: dir,
+      log: { log: () => {} },
+      env: { NEW_AUTH_TOKEN: "fixture-placeholder" },
+      classifyEnv: () => ({ forwarded: true, rule: "test" }),
+      getLaunchedEnvKeys: () => null,
+    });
+    const body = { url: "https://mcp.example.test/mcp", headers: { Authorization: "Bearer ${NEW_AUTH_TOKEN}" } };
+    const first = svc.setServer("svc", body);
+    expect(first).toMatchObject({ changed: true, restartRequired: true, launchEnvUnknown: true });
+    expect(first.warning).toMatch(/unknown/);
+    const retry = svc.setServer("svc", body);
+    expect(retry).toMatchObject({ changed: false, restartRequired: false, launchEnvUnknown: true });
+    expect(retry).not.toHaveProperty("warning");
+    expect(svc.setServer("svc", { requestTimeoutMs: 5000 })).toMatchObject({ changed: true, restartRequired: false });
+  });
+
+  it("R4-6: a body the route refuses for its bounds resolves to write tier, and the manifest documents both codes", () => {
+    const five = { "X-1": "${DOCS_AUTH_TOKEN}", "X-2": "${OTHER_AUTH_TOKEN}", "X-3": "${EXTRA_AUTH_TOKEN}", "X-4": "${ROTATED_AUTH_TOKEN}", "X-5": "${TENANT_AUTH_TOKEN}" };
+    expect(tierFor({ headers: five })).toBe("write");
+    expect(tierFor({ url: "https://n.example.test/mcp", headers: five }, undefined)).toBe("write");
+    expect(tierFor({ headers: { "X-1": "${DOCS_AUTH_TOKEN}" } })).toBe("dangerous");
+    const fields = manifest.findOp("PUT", "/api/mcp/servers/brain").params.fields;
+    expect(fields.find((f) => f.name === "url").description).toContain("too_many_env_refs");
+    expect(fields.find((f) => f.name === "headers").description).toContain("too_many_headers");
+  });
+
+  it("R4-7: a %-encoded ${VAR} in the path is shown decoded in the url piece", () => {
+    expect(describeServerSet({ name: "s", current: undefined, patch: { url: "https://h.example.test/%24%7BPATH_API_KEY%7D/mcp" } })).toBe(
+      'server "s" NEW; url https://h.example.test/${PATH_API_KEY}~; SENDS no credential',
     );
   });
 });
