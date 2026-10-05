@@ -340,7 +340,8 @@ Step labels are human ("Checking plugins", "Stopping gateway", "Starting gateway
 > when its own reap timer had to kill a gateway still draining). The stop
 > contract is the same for both shapes since the 2026-10-04 update below.
 >
-> **2026-10-04 update (OpenClaw 2026.9.8 drain model, refuter finding M2).**
+> **2026-10-04 update (OpenClaw 2026.9.8 drain model, refuter finding M2;
+> revised 2026-10-05 after refuter round 2).**
 > Since 2026.9.6 the serving gateway (`openclaw-gateway`) owns drain and cleanup
 > on SIGTERM: it stops admitting work, drains for up to 315 s, keeps a 10 s
 > cleanup reserve, and releases state ownership only after that settles
@@ -348,35 +349,54 @@ Step labels are human ("Checking plugins", "Stopping gateway", "Starting gateway
 > `docs/gateway/gateway-lock.md` "On shutdown, ..."). The launcher forwards
 > the signal and reaps its child only at the end of the 330 s service stop
 > budget (`gateway-shutdown-budget.mjs` `GATEWAY_SERVICE_STOP_TIMEOUT_MS`;
-> `node-runtime-recovery.mjs` re-SIGTERMs at 328 s, SIGKILLs at 329 s, exits 1
-> at 330 s), not after the 1/2/3 s backstop 2026.9.5 had. AlphaClaw now:
+> `node-runtime-recovery.mjs` re-SIGTERMs at 328 s, SIGKILLs at 329 s, then
+> re-raises the child's signal and dies by it — `process.exit(1)` only if the
+> child survives that SIGKILL for 1 s, lines 141-146), not after the 1/2/3 s
+> backstop 2026.9.5 had. AlphaClaw now:
 > - **stop** (`stopGatewayChildAndWait`, both shapes): SIGTERM, then wait for
->   the launcher AND its worker to exit for `kGatewayStopBudgetMs`
+>   the launcher AND its worker to exit — also a worker that outlives its
+>   launcher, or that the launcher forks after the stop began (re-resolved
+>   from /proc while the launcher lives) — for `kGatewayStopBudgetMs`
 >   (`ALPHACLAW_GATEWAY_STOP_TIMEOUT`, default 345 s = 330 + 15, clamped
->   10–900); AlphaClaw's own shutdown uses `kGatewayShutdownStopBudgetMs`
->   (`ALPHACLAW_GATEWAY_SHUTDOWN_STOP_TIMEOUT`, same default) inside a process
->   deadline derived to outlive it (`kProcessShutdownDeadlineMs` = budget +
->   10 s). SIGKILL only past the budget, worker FIRST — SIGKILL cannot be
+>   10–900). SIGKILL only past the budget, worker FIRST — SIGKILL cannot be
 >   forwarded, so killing the launcher alone orphans the gateway on the port.
 >   `killManagedGatewayChildNow` (the last-ditch `killGatewayNow`) is
 >   worker-first too and no longer skips an adopted launcher.
+> - **shutdown deadline chain**: AlphaClaw's own shutdown uses
+>   `kGatewayShutdownStopBudgetMs` (`ALPHACLAW_GATEWAY_SHUTDOWN_STOP_TIMEOUT`,
+>   default 335 s = 330 + 5) inside `kProcessShutdownDeadlineMs` = budget +
+>   10 s (345 s; also the self-update drain race). Chain with defaults:
+>   launcher 330 s < shutdown stop 335 s < process deadline 345 s < platform
+>   stop grace, which must be ≥ deadline + 15 s (`kPlatformStopGraceFloorMs`,
+>   360 s). During the drain, stdout/stderr write errors (EPIPE from a dead
+>   `| tee`) are swallowed and an uncaught-exception re-entry is a no-op; only
+>   an explicit second signal or the process deadline calls `killGatewayNow`.
 > - **cold restart** (`runGatewayColdStart` → `waitForGatewayReleased`): the
->   replacement is spawned only after the old gateway's serving processes
->   (managed child + worker, the owner of this state directory's projection and
->   its launcher, the unambiguous serving identity — captured with /proc start
->   ticks) have exited and none of them owns
->   `$OPENCLAW_STATE_DIR/tmp/openclaw-<uid>/gateway.state.lock`; without /proc
->   pid evidence, the port must be closed and the projection unheld. Past the
->   budget (measured from the SIGTERM) AlphaClaw's own processes are SIGKILLed
->   and the restart throws `GatewayIncumbentRestartError` with
+>   old gateway's processes are the managed child + worker and the owner of
+>   THIS state directory's projection
+>   `$OPENCLAW_STATE_DIR/tmp/openclaw-<uid>/gateway.state.lock` plus its
+>   launcher (captured with /proc start ticks; `resolveServingIdentity` is not
+>   used — it is not state-dir-aware). The projection counts as held only when
+>   its payload's `startTime` equals the pid's /proc start ticks and its
+>   `stateDir` equals this state dir (a stale lock is skipped). Release:
+>   with pid evidence, all of those processes exited and none owns the
+>   projection — the port is NOT consulted; without pid evidence, the port is
+>   closed and the projection unheld. Past the budget (measured from the
+>   SIGTERM) AlphaClaw SIGKILLs its OWN processes (worker first) and re-checks
+>   release for 5 s: confirmed → the replacement is started (availability
+>   first); still unconfirmed → `GatewayIncumbentRestartError` with
 >   `phase: "stop_release"` (reason `incumbent_gateway_still_running`, so the
->   watchdog's `awaitingAutoRepairRecovery` latch applies) — nothing is
+>   watchdog's `awaitingAutoRepairRecovery` latch applies) and nothing is
 >   spawned. The old 15 s stop-settle followed by `gateway --force` raced a
 >   draining gateway: non-interactive `--force` refuses to kill a verified
->   listener (`docs/cli/gateway/running.md`), and a new gateway waits up to five
->   minutes for state ownership (`gateway-lock.md`). A state-owning serving
->   gateway this AlphaClaw process did not spawn gets one SIGTERM, never a
->   SIGKILL.
+>   listener (`docs/cli/gateway/running.md`), and a new gateway waits up to
+>   five minutes for state ownership (`gateway-lock.md`). A verified
+>   state-owning serving gateway this AlphaClaw process did not spawn gets
+>   one SIGTERM, never a SIGKILL.
+> - **watchdog readiness**: a `/readyz` `draining` body is transitional for
+>   `kGatewayDrainingReadinessBudgetMs` (330 + 15 = 345 s), `starting` for
+>   `kGatewayRestartReadyTimeoutMs` (300 s); a phase change (draining →
+>   starting) restarts the transitional clock.
 > - **budgets**: `kGatewayRestartOperationBudgetMs` = ready wait + 240 s
 >   preflight + stop budget + 45 s (floored at the lease), so the lock, the
 >   operation record and the watchdog suppression windows cover the drain. The
