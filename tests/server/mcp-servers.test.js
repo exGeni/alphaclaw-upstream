@@ -269,7 +269,8 @@ describe("mcp server redaction", () => {
     });
     expect(out.literalHeaders).toEqual(["X-Api-Key", "X-Mixed", "X-Scheme"]);
     expect(out.env).toEqual({ TOKEN: "<literal>", OTHER: "${OTHER_REF}" });
-    expect(out.otherKeys).toEqual(["somethingNew"]);
+    expect(out.otherKeys).toBe(1); // a count, never the key name
+    expect(text).not.toContain("somethingNew");
     expect(out.managed).toBe(true);
     expect(out.codex).toEqual({ agents: ["tiflis"], defaultToolsApprovalMode: "approve" });
     expect(out.toolFilter).toEqual({ include: ["search", "get_page", "query"] });
@@ -445,7 +446,7 @@ describe("mcp confirm summaries (M3)", () => {
         },
       }),
     ).toBe(
-      'server "docs" NEW rev absent; url https://docs.example.test/mcp?page=<redac~; SENDS ${DOCS_AUTH_TOKEN}; transport sse; filter narrowed; headers +1 -0; include +1 ["search"]; set Authorization=Bearer ${DOCS_AUTH_TOKEN}',
+      'server "docs" NEW rev absent; url https://docs.example.test/mcp?page%3D<red~; SENDS ${DOCS_AUTH_TOKEN}; transport sse; filter narrowed; headers +1 -0; include +1 ["search"]; set Authorization=Bearer ${DOCS_AUTH_TOKEN}',
     );
     expect(
       summary({ pathParams: { name: "brain" }, body: { revision: entryRevision(baseEntry()), toolFilter: { include: ["search", "put_page", "get_*"], exclude: ["query"] } } }),
@@ -462,7 +463,7 @@ describe("mcp confirm summaries (M3)", () => {
     const remove = manifest.findOp("DELETE", "/api/mcp/servers/brain");
     expect(typeof set.confirmSummary).toBe("function");
     const req = { method: "DELETE", baseUrl: "/api", path: "/mcp/servers/legacy", query: {}, body: null };
-    expect(buildConfirmSummary(remove, req)).toBe('Remove an MCP server: server "legacy"');
+    expect(buildConfirmSummary(remove, req)).toMatch(/^Remove an MCP server: server "legacy"/);
     expect(manifest.getManifest().ops.find((o) => o.id === "mcp.server-set").detailedConfirm).toBe(true);
   });
 });
@@ -1388,5 +1389,193 @@ describe("round 6: word-key caps (R6 m4)", () => {
     expect(long.length).toBeGreaterThan(48);
     expect(looksLikeCredentialKey(long)).toBe(true);
     expect(codeOf(() => parseServerPatch({ url: `https://x.example.test/mcp?${w1}-${w2}-${w3}=1` }))).toBe("literal_secret");
+  });
+});
+
+describe("round 7: summaries survive secret redaction; strict list projection; remove summary (R7)", () => {
+  const { buildAdminSkillContent } = require("../../lib/server/agent-admin/skill");
+  const { createServerRemoveConfirmSummary } = require("../../lib/server/admin-manifest/domains/mcp");
+  const { describeServerRemove } = require("../../lib/server/mcp-servers");
+  // Credential-shaped fixtures are assembled at runtime; none is real.
+  const ghToken = "gh" + "p_" + "Q7xZ2kLm9PwR4tYb8NcV3hJd6FsA1eGu0Kio";
+  const setSummary = (stored, body) => {
+    const op = {
+      ...manifest.findOp("PUT", "/api/mcp/servers/brain"),
+      confirmSummary: createServerSetConfirmSummary({ readConfig: () => ({ mcp: { servers: { brain: stored } } }) }),
+    };
+    return buildConfirmSummary(op, {
+      method: "PUT",
+      baseUrl: "/api",
+      path: "/mcp/servers/brain",
+      body: { revision: entryRevision(stored), ...body },
+      query: {},
+    });
+  };
+  const widenWithHeader = { toolFilter: { include: ["*"] }, headers: { "X-Other": "Bearer ${OTHER_AUTH_TOKEN}" } };
+  const expectCriticalIntact = (summary, label) => {
+    expect(summary, label).toContain("; SENDS ${GBRAIN_TEST_AUTH_TOKEN}, ${OTHER_AUTH_TOKEN}; FILTER WIDENED; GLOB IN FILTER; headers +1 -0");
+    expect(summary.length, label).toBeLessThanOrEqual(400);
+  };
+
+  it("R7 major: a stored url with cookie: / set-cookie: keeps SENDS, FILTER WIDENED and GLOB through the full confirm pipeline", () => {
+    for (const url of ["https://brain.example.test/cookie:/mcp", "https://brain.example.test/set-cookie:", "https://x.cookie:8443/mcp"]) {
+      const stored = { url, headers: { Authorization: "Bearer ${GBRAIN_TEST_AUTH_TOKEN}" }, toolFilter: { include: ["search"] } };
+      const summary = setSummary(stored, widenWithHeader);
+      expectCriticalIntact(summary, url);
+      expect(summary).not.toContain("***");
+    }
+  });
+
+  it("R7 major: for every redactSecretShapes pattern, a url carrying its trigger does not truncate the critical part", () => {
+    const triggers = {
+      "provider key sk-": "https://h.example.test/a.sk-abcdefghijklmnop/mcp",
+      bearer: "https://h.example.test/Bearer/abcdefghijklmnop",
+      jwt: "https://h.example.test/eyJabcdefg.hijklmnop.qrstuvwxy",
+      "google key": `https://h.example.test/AIza${"a".repeat(32)}`,
+      "github token": `https://h.example.test/${ghToken}`,
+      "slack token": "https://h.example.test/xoxb-abcdefghijkl",
+      "aws key id": "https://h.example.test/AKIAABCDEFGHIJKLMNOP",
+      "slack webhook": "https://hooks.slack.com/services/T000/B000/xyz",
+      userinfo: "https://user:pw-fixture@h.example.test/mcp",
+      cookie: "https://h.example.test/set-cookie:/mcp",
+      "signed query": "https://h.example.test/mcp?token=abc&key=1",
+    };
+    // One trigger per pattern in lib/server/utils/redact.js: a new pattern
+    // there fails this count until it gets a trigger here.
+    const source = fs.readFileSync(path.join(__dirname, "../../lib/server/utils/redact.js"), "utf8");
+    const block = source.slice(source.indexOf("const kSecretShapePatterns"), source.indexOf("const redactSecretShapes"));
+    expect(Object.keys(triggers)).toHaveLength((block.match(/\bpattern:/g) || []).length);
+    for (const [label, url] of Object.entries(triggers)) {
+      const stored = { url, headers: { Authorization: "Bearer ${GBRAIN_TEST_AUTH_TOKEN}" }, toolFilter: { include: ["search"] } };
+      expectCriticalIntact(setSummary(stored, widenWithHeader), label);
+    }
+  });
+
+  it("R7 major: the escapes never lengthen the critical part past the IPv6 worst case", () => {
+    const refs = ["R0_XY_AUTH_TOKEN", "R1_XY_AUTH_TOKEN", "R2_X_AUTH_TOKEN", "R3_X_AUTH_TOKEN"];
+    for (const ref of refs) vi.stubEnv(ref, "fixture-placeholder");
+    const literal = Object.fromEntries(Array.from({ length: 32 }, (_, i) => [`L-${i}`, "plain"]));
+    const current = { url: "http://x.example.test/mcp", toolFilter: { include: ["a"] }, headers: literal };
+    const headers = {};
+    for (let i = 0; i < 16; i += 1) headers[`X-${i}`] = `Bearer \${${refs[i % 4]}}`;
+    for (let i = 0; i < 16; i += 1) headers[`L-${i}`] = null;
+    const name = "n".repeat(64);
+    for (const url of [
+      `https://mcpserver.mcpserver.mcpserver.mcpserver.a-cookie:65535/cookie:${"a".repeat(45)}?q=1`,
+      `https://hooks.slack.com/services/${"a".repeat(45)}?q=1`,
+    ]) {
+      const op = { ...manifest.findOp("PUT", `/api/mcp/servers/${name}`), confirmSummary: createServerSetConfirmSummary({ readConfig: () => ({ mcp: { servers: { [name]: current } } }) }) };
+      const summary = buildConfirmSummary(op, {
+        method: "PUT",
+        baseUrl: "/api",
+        path: `/mcp/servers/${name}`,
+        body: { revision: entryRevision(current), url, transport: "streamable-http", toolFilter: { include: ["b*"], exclude: ["c"] }, headers },
+        query: {},
+      });
+      const mark = "headers +16 -16";
+      expect(summary, url).toContain(mark);
+      expect(summary.indexOf(mark) + mark.length, url).toBeLessThanOrEqual(398);
+      for (const ref of refs) expect(summary).toContain(`\${${ref}}`);
+    }
+  });
+
+  it("R7 m2: a non-http(s) stored scheme renders as other: and cannot overflow the clamp", () => {
+    const stored = { url: `${"x".repeat(300)}://h.example.test/mcp`, headers: { Authorization: "Bearer ${GBRAIN_TEST_AUTH_TOKEN}" }, toolFilter: { include: ["search"] } };
+    const summary = setSummary(stored, widenWithHeader);
+    expect(summary).toContain("url unchanged other://h.example.test/mcp; SENDS");
+    expectCriticalIntact(summary, "long scheme");
+    const moved = setSummary({ url: `${"y".repeat(200)}://h.example.test/mcp` }, { url: "https://h.example.test/mcp" });
+    expect(moved).toContain("url https://h.example.test/mcp (was other); SENDS no credential");
+  });
+
+  it("R7 m3: ordinary absolute cert and key paths are shown; only segments are credential-checked", () => {
+    for (const p of ["/data/.openclaw/certs/client.pem", "/var/lib/openclaw/mcp/gbrain.client.crt", "/data/certs/mtls-client-2026-09-01.crt"]) {
+      expect(redactMcpServerEntry({ clientCert: p, clientKey: p })).toEqual({ clientCert: p, clientKey: p });
+    }
+    expect(redactMcpServerEntry({ clientKey: `/data/certs/${ghToken}` }).clientKey).toBe("<redacted>");
+  });
+
+  it("codex P1: list projection shows schema-typed values only, and unknown keys as a count", () => {
+    const sk = "sk" + "-live-" + "a1B2c3D4e5F6g7H8i9J0";
+    const out = redactMcpServerEntry({
+      url: "https://h.example.test/mcp",
+      enabled: ghToken,
+      supportsParallelToolCalls: true,
+      sslVerify: "false",
+      connectionTimeoutMs: ghToken,
+      requestTimeoutMs: 30000,
+      transport: sk,
+      cwd: `/home/svc/${ghToken}`,
+      oauth: { identity: ghToken, authProfileId: ghToken, scope: `docs.read ${ghToken}`, redirectUrl: "https://h.example.test/cb", [ghToken]: 1 },
+      toolFilter: { include: ["search", ghToken], exclude: ghToken, [sk]: ["x"] },
+      codex: { agents: ["tiflis", sk], defaultToolsApprovalMode: ghToken, [ghToken]: true },
+      headers: { [ghToken]: "Bearer ${GBRAIN_TEST_AUTH_TOKEN}", "X-Ok": "${OTHER_AUTH_TOKEN}" },
+      env: { [sk]: "x" },
+      [ghToken]: "unknown key named like a token",
+      another: 1,
+    });
+    const text = JSON.stringify(out);
+    expect(text).not.toContain(ghToken);
+    expect(text).not.toContain(sk);
+    expect(out).toMatchObject({
+      enabled: "<redacted>",
+      supportsParallelToolCalls: true,
+      sslVerify: "<redacted>",
+      connectionTimeoutMs: "<redacted>",
+      requestTimeoutMs: 30000,
+      transport: "<redacted>",
+      cwd: "<redacted>",
+      oauth: { identity: "<redacted>", authProfileId: "<redacted>", scope: "<redacted>", redirectUrl: "https://h.example.test/cb", otherKeys: 1 },
+      toolFilter: { include: ["search", "<redacted>"], exclude: "<redacted>", otherKeys: 1 },
+      codex: { agents: ["tiflis", "<redacted>"], defaultToolsApprovalMode: "<redacted>", otherKeys: 1 },
+      headers: { "<redacted-1>": "Bearer ${GBRAIN_TEST_AUTH_TOKEN}", "X-Ok": "${OTHER_AUTH_TOKEN}" },
+      env: { "<redacted-1>": "<literal>" },
+      otherKeys: 2,
+    });
+    expect(redactMcpServerEntry({ cwd: "/srv/mcp", oauth: { identity: "shared", scope: "docs.read docs.write" }, transport: "stdio" })).toEqual({
+      cwd: "/srv/mcp",
+      oauth: { identity: "shared", scope: "docs.read docs.write" },
+      transport: "stdio",
+    });
+  });
+
+  it("codex P1: the remove summary names the entry's url and what it sends, or that it is not found", () => {
+    const stored = { url: "https://brain.example.test/mcp", headers: { Authorization: "Bearer ${GBRAIN_TEST_AUTH_TOKEN}", "X-Raw": kLiteralCore } };
+    const rev = entryRevision(stored);
+    const op = {
+      ...manifest.findOp("DELETE", "/api/mcp/servers/brain"),
+      confirmSummary: createServerRemoveConfirmSummary({ readConfig: () => ({ mcp: { servers: { brain: stored } } }) }),
+    };
+    const remove = (name, query) => buildConfirmSummary(op, { method: "DELETE", baseUrl: "/api", path: `/mcp/servers/${name}`, body: null, query });
+    expect(remove("brain", { revision: rev })).toBe(
+      `Remove an MCP server: server "brain" REMOVE rev ${rev.slice(0, 8)}; url https://brain.example.test/mcp; SENDS \${GBRAIN_TEST_AUTH_TOKEN}, 1 literal header`,
+    );
+    expect(remove("brain", { revision: "0000000000000000" })).toContain("REMOVE rev STALE; url https://brain.example.test/mcp");
+    expect(remove("brain", {})).toContain("REMOVE rev MISSING");
+    expect(remove("nope", { revision: rev })).toBe('Remove an MCP server: server "nope" not found');
+    expect(remove("brain", { revision: rev })).not.toContain(kLiteralCore);
+    // Worst case: 64-char name, IPv6 host with port, clipped path, refs at
+    // the 80-character bound, 32 literal headers.
+    const refs = ["R0_XY_AUTH_TOKEN", "R1_XY_AUTH_TOKEN", "R2_X_AUTH_TOKEN", "R3_X_AUTH_TOKEN"];
+    const big = {
+      url: `https://[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535/${"a".repeat(45)}?q=1`,
+      headers: {
+        ...Object.fromEntries(refs.map((r, i) => [`X-${i}`, `Bearer \${${r}}`])),
+        ...Object.fromEntries(Array.from({ length: 28 }, (_, i) => [`L-${i}`, "plain"])),
+      },
+    };
+    const worst = describeServerRemove({ name: "n".repeat(64), current: big, revision: entryRevision(big) });
+    const full = `Remove an MCP server: ${worst}`;
+    expect(full.length).toBeLessThanOrEqual(400);
+    for (const r of refs) expect(full).toContain(`\${${r}}`);
+    expect(full).toContain("28 literal headers");
+  });
+
+  it("R7 m4: the skill table tells agents to send revision on set and ?revision= on remove", () => {
+    const content = buildAdminSkillContent({ fs, manifest: manifest.getManifest(), liveState: { adminTargets: [], activeChannels: [], releaseChannel: "stable" } });
+    const setRow = content.split("\n").find((line) => line.includes("PUT /api/mcp/servers/:name"));
+    const removeRow = content.split("\n").find((line) => line.includes("DELETE /api/mcp/servers/:name"));
+    expect(setRow).toContain('Body needs "revision"');
+    expect(removeRow).toContain("?revision=<rev>");
   });
 });
