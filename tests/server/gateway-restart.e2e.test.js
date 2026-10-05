@@ -774,7 +774,10 @@ describe("server/gateway restart drills (e2e)", () => {
       expect(status.body.lastOperation.evidence).toContain(
         "incumbent evidence:",
       );
-      expect(status.body.lastOperation.evidence).toContain('"survivingPids":[31337]');
+      // The incumbent is not attributable to this state dir (no managed
+      // child, no projection): the open port is what blocked the restart.
+      expect(status.body.lastOperation.evidence).toContain('"preStopPids":[31337]');
+      expect(status.body.lastOperation.evidence).toContain('"portOpen":true');
       expect(status.body.lastOperation.evidence).toContain('"cliRefused":true');
 
       // Ledger: the generic failed restart carries the reason, and the
@@ -801,7 +804,7 @@ describe("server/gateway restart drills (e2e)", () => {
             cliRefused: true,
             cliExitCode: 1,
             preStopPids: [31337],
-            survivingPids: [31337],
+            survivingPids: [],
             // Failed in the stop phase: nothing was spawned, so there is no
             // supervisor pid and no post-ready snapshot.
             phase: "stop_release",

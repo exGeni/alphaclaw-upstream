@@ -343,6 +343,69 @@ describe("server/init/server-lifecycle", () => {
     expect(stopGateway).toHaveBeenCalledTimes(1);
   });
 
+  it("a CRASH re-entry while draining (uncaught exception) neither kills the gateway nor exits; an explicit second signal still does (B1)", async () => {
+    let releaseStop;
+    const stopGateway = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          releaseStop = resolve;
+        }),
+    );
+    const killGatewayNow = vi.fn();
+    const exitCalls = [];
+    const lifecycle = createServerLifecycle({
+      server: new EventEmitter(),
+      PORT: 3999,
+      stopGateway,
+      killGatewayNow,
+      flushLogs: vi.fn(),
+      exitImpl: (code) => exitCalls.push(code),
+      logger: createSilentLogger(),
+      listenRetryDelayMs: 1,
+      shutdownDeadlineMs: 5000,
+    });
+    const first = lifecycle.gracefulExit(0, "SIGTERM");
+    await new Promise((resolve) => setImmediate(resolve));
+    // OpenClaw 2026.9.6+: the gateway may still be draining in-flight turns.
+    await lifecycle.gracefulExit(1, "uncaught exception", { source: "crash" });
+    expect(killGatewayNow).not.toHaveBeenCalled();
+    expect(exitCalls).toEqual([]);
+    // The operator's explicit second signal keeps the hard-exit contract.
+    await lifecycle.gracefulExit(0, "SIGTERM");
+    expect(killGatewayNow).toHaveBeenCalledTimes(1);
+    expect(exitCalls).toEqual([0]);
+    releaseStop();
+    await first;
+  });
+
+  it("installCrashGuards attaches an 'error' listener to the stdio streams so EPIPE is never thrown (B1)", () => {
+    const stdout = new EventEmitter();
+    const stderr = new EventEmitter();
+    const saved = ["unhandledRejection", "uncaughtException", "SIGTERM", "SIGINT"].map((event) => [
+      event,
+      process.listeners(event),
+    ]);
+    try {
+      const lifecycle = createServerLifecycle({
+        server: new EventEmitter(),
+        PORT: 3999,
+        logger: createSilentLogger(),
+        stdioStreams: [stdout, stderr],
+        exitImpl: vi.fn(),
+      });
+      lifecycle.installCrashGuards();
+      // Without a listener EventEmitter#emit("error") throws.
+      expect(() => stdout.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }))).not.toThrow();
+      expect(() => stderr.emit("error", Object.assign(new Error("destroyed"), { code: "ERR_STREAM_DESTROYED" }))).not.toThrow();
+      expect(lifecycle.getStdioErrorCount()).toBe(2);
+    } finally {
+      for (const [event, listeners] of saved) {
+        process.removeAllListeners(event);
+        for (const listener of listeners) process.on(event, listener);
+      }
+    }
+  });
+
   it("a signal during a marked-exiting drain exits immediately without a second drain", async () => {
     const stopGateway = vi.fn(async () => {});
     const killGatewayNow = vi.fn();

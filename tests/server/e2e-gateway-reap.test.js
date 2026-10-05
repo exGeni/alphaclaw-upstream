@@ -27,8 +27,13 @@ const path = require("path");
 
 const kTmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alphaclaw-gw-reap-"));
 process.env.ALPHACLAW_ROOT_DIR = kTmpRoot;
+// The restart stop budget at its 10s floor so the over-budget cold-restart
+// cases run in seconds (explicit budgetMs drives the direct stop cases).
+process.env.ALPHACLAW_GATEWAY_STOP_TIMEOUT = "10";
 
-const { OPENCLAW_DIR } = require("../../lib/server/constants");
+const { OPENCLAW_DIR, kGatewayStopBudgetMs } = require("../../lib/server/constants");
+// constants.js read it at load; never leak it into another file's process.
+delete process.env.ALPHACLAW_GATEWAY_STOP_TIMEOUT;
 const lockContention = require("../../lib/server/openclaw-lock-contention");
 const {
   readProcStartTicks,
@@ -441,6 +446,12 @@ describe("gateway reap e2e (real child processes via PATH-shimmed openclaw)", ()
     runHoldsState = false,
     forceDrain = "1",
     forceListen = true,
+    // false: the launcher forwards SIGTERM and exits at once, leaving its
+    // worker to drain alone (the worker outlives the launcher).
+    launcherWaits = true,
+    // Seconds the launcher waits before forking its worker (the window right
+    // after spawn in which a stop finds no worker yet).
+    workerDelay = null,
   } = {}) => {
     const port = readGatewayPort();
     fs.rmSync(stateLockPath, { force: true });
@@ -467,7 +478,13 @@ describe("gateway reap e2e (real child processes via PATH-shimmed openclaw)", ()
         `if [ "$5" = "1" ]; then ${JSON.stringify(process.execPath)} ${JSON.stringify(listenerPath)} & listener=$!; echo $listener > ${JSON.stringify(caseDir)}/listener-$3.pid; fi`,
         'if [ "$4" = "never" ]; then',
         "  trap '' TERM",
-        "  while :; do sleep 1; done",
+        // Orphan tell: if the launcher dies while this worker still lives
+        // (a launcher-first SIGKILL), the worker's parent changes.
+        "  while :; do",
+        "    p=$(cut -d' ' -f4 /proc/$$/stat)",
+        `    [ "$p" != "$PPID" ] && echo orphaned >> ${JSON.stringify(caseDir)}/worker-$3.orphaned`,
+        "    sleep 0.05",
+        "  done",
         "fi",
         // Upstream's state-ownership projection (docs/gateway/gateway-lock.md):
         // published at start, removed only AFTER the drain settles, while the
@@ -486,11 +503,15 @@ describe("gateway reap e2e (real child processes via PATH-shimmed openclaw)", ()
         "#!/bin/sh",
         'if [ "$1" = "gateway" ] && { [ "$2" = "run" ] || [ "$2" = "--force" ]; }; then',
         '  if [ "$2" = "run" ]; then tag=run; drain=' + JSON.stringify(runDrain) + "; listen=" + (runListen ? "1" : "0") + "; else tag=force; drain=" + JSON.stringify(forceDrain) + "; listen=" + (forceListen ? "1" : "0") + "; fi",
+        ...(workerDelay !== null ? ["  trap 'term=1' TERM INT"] : []),
         `  date +%s%N > ${JSON.stringify(caseDir)}/launch-$tag.at`,
         '  if [ "$tag" = "run" ]; then state=' + (runHoldsState ? "1" : "0") + "; else state=0; fi",
+        ...(workerDelay !== null ? [`  sleep ${workerDelay}`] : []),
         `  ${JSON.stringify(workerScript)} gateway run "$tag" "$drain" "$listen" "$state" &`,
         "  worker=$!",
-        "  trap 'kill -TERM $worker 2>/dev/null' TERM INT",
+        launcherWaits
+          ? "  trap 'kill -TERM $worker 2>/dev/null' TERM INT"
+          : "  trap 'kill -TERM $worker 2>/dev/null; exit 143' TERM INT",
         "  wait $worker; rc=$?",
         "  while kill -0 $worker 2>/dev/null; do wait $worker; rc=$?; done",
         "  exit $rc",
@@ -558,6 +579,9 @@ describe("gateway reap e2e (real child processes via PATH-shimmed openclaw)", ()
     // The worker that ignored SIGTERM is dead too: killing only the launcher
     // (the pre-fix behaviour) would have left it orphaned and alive.
     expect(isPidAlive(workerPid)).toBe(false);
+    // Worker FIRST: it never saw its launcher die (its parent never changed).
+    await sleep(200);
+    expect(fs.existsSync(path.join(caseDir, "worker-run.orphaned"))).toBe(false);
     await pollUntil(() => child.exitCode !== null || child.signalCode !== null, { label: "launcher exit event" });
     // The launcher either died BY our SIGKILL or exited on its own the moment
     // its worker was SIGKILLed first (the worker-first order).
@@ -603,6 +627,8 @@ describe("gateway reap e2e (real child processes via PATH-shimmed openclaw)", ()
     expect(stopped).toBe(true);
     expect(elapsedMs).toBeGreaterThanOrEqual(950);
     expect(isPidAlive(workerPid)).toBe(false);
+    await sleep(200);
+    expect(fs.existsSync(path.join(caseDir, "worker-force.orphaned"))).toBe(false);
     // The fixture's listener is the worker's own child (a real gateway's
     // helpers die with it); reap it so the port is free for later cases.
     try {
@@ -643,4 +669,275 @@ describe("gateway reap e2e (real child processes via PATH-shimmed openclaw)", ()
     // Clean up the adopted replacement through the same stop contract.
     expect(await gateway.stopGatewayChildAndWait({ budgetMs: 10_000 })).toBe(true);
   });
+
+  // ── Refuter round 2 (M1/M3): kill the surviving mutants ─────────────────
+  // A process that writes a VERIFIED projection (pid + its own /proc start
+  // ticks + this canonical state dir), like 2026.9.8's acquireGatewayLock.
+  const writeOwnerScript = ({ name, argvTail, mode, holdSeconds = "2" }) => {
+    const dir = path.join(caseDir, name);
+    fs.mkdirSync(dir, { recursive: true });
+    const script = path.join(dir, "openclaw");
+    const stateDir = fs.realpathSync(OPENCLAW_DIR);
+    fs.writeFileSync(
+      script,
+      [
+        "#!/bin/sh",
+        `echo $$ > ${JSON.stringify(caseDir)}/${name}.pid`,
+        `lockfile=${JSON.stringify(stateLockPath)}`,
+        'mkdir -p "$(dirname "$lockfile")"',
+        "st=$(cut -d' ' -f22 /proc/$$/stat)",
+        `printf '{"pid":%s,"startTime":%s,"stateDir":"%s","role":"gateway"}' $$ "$st" ${JSON.stringify(stateDir)} > "$lockfile"`,
+        ...(mode === "maintenance"
+          ? [
+              `sleep ${holdSeconds}`,
+              `date +%s%N > ${JSON.stringify(caseDir)}/${name}.released`,
+              'rm -f "$lockfile"',
+              "exit 0",
+            ]
+          : mode === "graceful"
+            ? [
+                "sleep 60 & s=$!",
+                `trap 'echo got-term >> ${JSON.stringify(caseDir)}/${name}.term; rm -f "$lockfile"; kill $s 2>/dev/null; date +%s%N > ${JSON.stringify(caseDir)}/${name}.released; exit 0' TERM`,
+                "wait $s",
+              ]
+            : [
+                // ignores SIGTERM (records it) and never releases
+                `trap 'echo got-term >> ${JSON.stringify(caseDir)}/${name}.term' TERM`,
+                "while :; do sleep 0.1; done",
+              ]),
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const proc = require("child_process").spawn(script, argvTail, { stdio: "ignore" });
+    trackPid(proc.pid);
+    return proc;
+  };
+
+  it("M3/a: the worker outlives its launcher — the stop waits for the worker, not just the launcher", async () => {
+    if (process.platform !== "linux") return;
+    scopeProcessScanToCase();
+    installDrainingGateway({ runDrain: "2.5", launcherWaits: false });
+    gateway = loadGateway();
+    const child = await gateway.launchGatewayProcess();
+    trackPid(child.pid);
+    await pollUntil(() => readPid(path.join(caseDir, "worker-run.pid")) !== null, { label: "worker pidfile" });
+    const workerPid = trackPid(readPid(path.join(caseDir, "worker-run.pid")));
+    const startedAt = Date.now();
+    expect(await gateway.stopGatewayChildAndWait({ budgetMs: 10_000 })).toBe(true);
+    const elapsedMs = Date.now() - startedAt;
+    // The launcher exited at once (143); the stop still waited out the drain.
+    expect(child.exitCode).toBe(143);
+    expect(elapsedMs).toBeGreaterThanOrEqual(2400);
+    expect(isPidAlive(workerPid)).toBe(false);
+    expect(fs.existsSync(path.join(caseDir, "worker-run.exited"))).toBe(true);
+  });
+
+  it("M3: a launcher stopped before it forked its worker — the late worker is found, waited on and SIGKILLed first; nothing orphaned", async () => {
+    if (process.platform !== "linux") return;
+    scopeProcessScanToCase();
+    installDrainingGateway({ runDrain: "never", workerDelay: "0.7" });
+    gateway = loadGateway();
+    const child = await gateway.launchGatewayProcess();
+    trackPid(child.pid);
+    // Stop as soon as the launcher runs (its TERM trap is armed) — no worker
+    // exists yet.
+    await pollUntil(() => fs.existsSync(path.join(caseDir, "launch-run.at")), { label: "launcher started" });
+    expect(readPid(path.join(caseDir, "worker-run.pid"))).toBeNull();
+    const pending = gateway.stopGatewayChildAndWait({ budgetMs: 2_500 });
+    await pollUntil(() => readPid(path.join(caseDir, "worker-run.pid")) !== null, { label: "late worker pidfile" });
+    const workerPid = trackPid(readPid(path.join(caseDir, "worker-run.pid")));
+    expect(await pending).toBe(true);
+    expect(isPidAlive(workerPid)).toBe(false);
+    await sleep(200);
+    expect(fs.existsSync(path.join(caseDir, "worker-run.orphaned"))).toBe(false);
+  });
+
+  it("M3/n: AlphaClaw's shutdown stop waits for the gateway's drain (kGatewayShutdownStopBudgetMs), no SIGKILL", async () => {
+    if (process.platform !== "linux") return;
+    scopeProcessScanToCase();
+    installDrainingGateway({ runDrain: "2.5" });
+    gateway = loadGateway();
+    const child = await gateway.launchGatewayProcess();
+    trackPid(child.pid);
+    await pollUntil(() => readPid(path.join(caseDir, "worker-run.pid")) !== null, { label: "worker pidfile" });
+    trackPid(readPid(path.join(caseDir, "worker-run.pid")));
+    const startedAt = Date.now();
+    await gateway.stopGatewayForShutdown();
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(2400);
+    expect(fs.existsSync(path.join(caseDir, "worker-run.exited"))).toBe(true);
+    await pollUntil(() => child.exitCode !== null || child.signalCode !== null, { label: "launcher exit" });
+    expect(child.signalCode).toBeNull();
+    expect(child.exitCode).toBe(0);
+  });
+
+  it("M3/d,m: the state-ownership check is part of the release wait — no spawn while a (non-serving) OpenClaw process still owns the state", async () => {
+    if (process.platform !== "linux") return;
+    scopeProcessScanToCase();
+    installDrainingGateway({ forceListen: true });
+    // No gateway at all; an OpenClaw maintenance process owns the state for
+    // 2s. Without /proc pid evidence the wait is port closed AND projection
+    // unheld.
+    writeOwnerScript({ name: "maint", argvTail: ["doctor"], mode: "maintenance", holdSeconds: "2" });
+    await pollUntil(() => fs.existsSync(stateLockPath), { label: "maintenance projection" });
+    gateway = loadGateway();
+    const result = await gateway.restartGateway(() => {});
+    trackPid(readPid(path.join(caseDir, "worker-force.pid")));
+    trackPid(readPid(path.join(caseDir, "listener-force.pid")));
+    expect(result).toMatchObject({ ok: true });
+    const releasedAt = readNs(path.join(caseDir, "maint.released"));
+    const spawnedAt = readNs(path.join(caseDir, "launch-force.at"));
+    expect(releasedAt).not.toBeNull();
+    expect(spawnedAt > releasedAt).toBe(true);
+    await gateway.stopGatewayChildAndWait({ budgetMs: 10_000 });
+  });
+
+  it("M3/g: a verified state-owning gateway AlphaClaw did not spawn gets SIGTERM (graceful) and the restart proceeds once it released", async () => {
+    if (process.platform !== "linux") return;
+    scopeProcessScanToCase();
+    installDrainingGateway({ forceListen: true });
+    const ext = writeOwnerScript({ name: "ext", argvTail: ["gateway", "run"], mode: "graceful" });
+    await pollUntil(() => fs.existsSync(stateLockPath), { label: "external projection" });
+    gateway = loadGateway();
+    const result = await gateway.restartGateway(() => {});
+    trackPid(readPid(path.join(caseDir, "worker-force.pid")));
+    trackPid(readPid(path.join(caseDir, "listener-force.pid")));
+    expect(result).toMatchObject({ ok: true });
+    expect(fs.readFileSync(path.join(caseDir, "ext.term"), "utf8")).toContain("got-term");
+    await pollUntil(() => ext.exitCode !== null || ext.signalCode !== null, { label: "external exit" });
+    expect(ext.signalCode).toBeNull();
+    expect(ext.exitCode).toBe(0);
+    await gateway.stopGatewayChildAndWait({ budgetMs: 10_000 });
+  });
+
+  it("M3/g: an external owner that ignores SIGTERM is NEVER SIGKILLed — past the budget the restart fails (stop_release) and spawns nothing", async () => {
+    if (process.platform !== "linux") return;
+    scopeProcessScanToCase();
+    installDrainingGateway({ forceListen: true });
+    const ext = writeOwnerScript({ name: "ext", argvTail: ["gateway", "run"], mode: "never" });
+    await pollUntil(() => fs.existsSync(stateLockPath), { label: "external projection" });
+    gateway = loadGateway();
+    expect(kGatewayStopBudgetMs).toBe(10_000);
+    const error = await gateway.restartGateway(() => {}).then(() => null, (e) => e);
+    expect(error).toBeInstanceOf(gateway.GatewayIncumbentRestartError);
+    expect(error.evidence).toMatchObject({ phase: "stop_release", stateOwnerPid: ext.pid });
+    expect(fs.existsSync(path.join(caseDir, "launch-force.at"))).toBe(false);
+    expect(fs.readFileSync(path.join(caseDir, "ext.term"), "utf8")).toContain("got-term");
+    expect(isPidAlive(ext.pid)).toBe(true);
+    expect(ext.signalCode).toBeNull();
+  }, 30_000);
+
+  it("M1 (P1): a STALE projection whose pid now belongs to another state dir's gateway is neither waited on nor signalled", async () => {
+    if (process.platform !== "linux") return;
+    scopeProcessScanToCase();
+    installDrainingGateway({ forceListen: true });
+    // A foreign isolated gateway (its own state dir), serving argv.
+    const foreignDir = path.join(caseDir, "foreign");
+    fs.mkdirSync(foreignDir, { recursive: true });
+    const foreignScript = path.join(foreignDir, "openclaw");
+    fs.writeFileSync(foreignScript, "#!/bin/sh\ntrap 'echo got-term >> " + JSON.stringify(path.join(caseDir, "foreign.term")) + "; exit 0' TERM\nwhile :; do sleep 0.1; done\n", { mode: 0o755 });
+    const foreign = require("child_process").spawn(foreignScript, ["gateway", "run"], { stdio: "ignore" });
+    trackPid(foreign.pid);
+    await sleep(200);
+    // OUR projection, left by a dead previous owner whose pid number the
+    // foreign gateway now has: different start time, different state dir.
+    fs.mkdirSync(path.dirname(stateLockPath), { recursive: true });
+    fs.writeFileSync(stateLockPath, JSON.stringify({ pid: foreign.pid, startTime: 1, stateDir: "/data/other-session/.openclaw", role: "gateway" }));
+    gateway = loadGateway();
+    const result = await gateway.restartGateway(() => {});
+    trackPid(readPid(path.join(caseDir, "worker-force.pid")));
+    trackPid(readPid(path.join(caseDir, "listener-force.pid")));
+    expect(result).toMatchObject({ ok: true });
+    expect(fs.existsSync(path.join(caseDir, "foreign.term"))).toBe(false);
+    expect(isPidAlive(foreign.pid)).toBe(true);
+    await gateway.stopGatewayChildAndWait({ budgetMs: 10_000 });
+  });
+
+  it("M2: past the budget AlphaClaw SIGKILLs its OWN wedged gateway (worker first) and, release now confirmed, starts the replacement", async () => {
+    if (process.platform !== "linux") return;
+    scopeProcessScanToCase();
+    // The managed gateway holds the port and ignores SIGTERM forever.
+    installDrainingGateway({ runDrain: "never", runListen: true, forceListen: true });
+    gateway = loadGateway();
+    const child = await gateway.launchGatewayProcess();
+    trackPid(child.pid);
+    await pollUntil(() => readPid(path.join(caseDir, "listener-run.pid")) !== null, { label: "old listener" });
+    const workerPid = trackPid(readPid(path.join(caseDir, "worker-run.pid")));
+    const oldListener = trackPid(readPid(path.join(caseDir, "listener-run.pid")));
+    // The fixture's listener is the worker's own child; a real gateway's
+    // socket dies with the gateway. Close it as soon as the worker is gone.
+    const reaper = setInterval(() => {
+      if (!isPidAlive(workerPid)) {
+        try {
+          process.kill(oldListener, "SIGKILL");
+        } catch {}
+      }
+    }, 50);
+    let result;
+    const startedAt = Date.now();
+    try {
+      result = await gateway.restartGateway(() => {});
+    } finally {
+      clearInterval(reaper);
+    }
+    trackPid(readPid(path.join(caseDir, "worker-force.pid")));
+    trackPid(readPid(path.join(caseDir, "listener-force.pid")));
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(kGatewayStopBudgetMs - 500);
+    expect(result).toMatchObject({ ok: true });
+    expect(isPidAlive(workerPid)).toBe(false);
+    expect(fs.existsSync(path.join(caseDir, "worker-run.orphaned"))).toBe(false);
+    expect(fs.existsSync(path.join(caseDir, "launch-force.at"))).toBe(true);
+    await gateway.stopGatewayChildAndWait({ budgetMs: 10_000 });
+  }, 30_000);
+
+  // M1, one identity field at a time (each check must stand on its own).
+  const spawnForeignGateway = (name) => {
+    const dir = path.join(caseDir, name);
+    fs.mkdirSync(dir, { recursive: true });
+    const script = path.join(dir, "openclaw");
+    fs.writeFileSync(script, "#!/bin/sh\ntrap 'echo got-term >> " + JSON.stringify(path.join(caseDir, `${name}.term`)) + "; exit 0' TERM\nwhile :; do sleep 0.1; done\n", { mode: 0o755 });
+    const proc = require("child_process").spawn(script, ["gateway", "run"], { stdio: "ignore" });
+    trackPid(proc.pid);
+    return proc;
+  };
+  const writeProjection = (payload) => {
+    fs.mkdirSync(path.dirname(stateLockPath), { recursive: true });
+    fs.writeFileSync(stateLockPath, JSON.stringify(payload));
+  };
+
+  it.each([
+    ["startTime differs (right stateDir)", (pid) => ({ pid, startTime: 1, stateDir: fs.realpathSync(OPENCLAW_DIR), role: "gateway" })],
+    ["stateDir differs (right startTime)", (pid) => ({ pid, startTime: readProcStartTicks(pid), stateDir: "/data/other-session/.openclaw", role: "gateway" })],
+  ])("M1: a projection whose %s is stale — not waited on, not signalled, the restart proceeds", async (_label, payloadFor) => {
+    if (process.platform !== "linux") return;
+    scopeProcessScanToCase();
+    installDrainingGateway({ forceListen: true });
+    const foreign = spawnForeignGateway("foreign");
+    await sleep(200);
+    writeProjection(payloadFor(foreign.pid));
+    gateway = loadGateway();
+    const result = await gateway.restartGateway(() => {});
+    trackPid(readPid(path.join(caseDir, "worker-force.pid")));
+    trackPid(readPid(path.join(caseDir, "listener-force.pid")));
+    expect(result).toMatchObject({ ok: true });
+    expect(fs.existsSync(path.join(caseDir, "foreign.term"))).toBe(false);
+    expect(isPidAlive(foreign.pid)).toBe(true);
+    await gateway.stopGatewayChildAndWait({ budgetMs: 10_000 });
+  });
+
+  it("M1: an UNVERIFIED projection (older payload: pid only) still blocks the restart but never earns the external SIGTERM", async () => {
+    if (process.platform !== "linux") return;
+    scopeProcessScanToCase();
+    installDrainingGateway({ forceListen: true });
+    const foreign = spawnForeignGateway("legacy");
+    await sleep(200);
+    writeProjection({ pid: foreign.pid });
+    gateway = loadGateway();
+    const error = await gateway.restartGateway(() => {}).then(() => null, (e) => e);
+    expect(error).toBeInstanceOf(gateway.GatewayIncumbentRestartError);
+    expect(error.evidence).toMatchObject({ phase: "stop_release", stateOwnerPid: foreign.pid });
+    expect(fs.existsSync(path.join(caseDir, "legacy.term"))).toBe(false);
+    expect(isPidAlive(foreign.pid)).toBe(true);
+    expect(fs.existsSync(path.join(caseDir, "launch-force.at"))).toBe(false);
+  }, 30_000);
 });

@@ -2449,6 +2449,48 @@ describe("server/gateway restart behavior", () => {
       }
     });
 
+    it("start-ticks guard (M3/h): a worker pid number reused by another process during the drain is neither waited on nor SIGKILLed", async () => {
+      const child = createChild();
+      childProcess.spawn = vi.fn(() => child);
+      childProcess.execSync = vi.fn(() => "");
+      fs.existsSync = vi.fn(() => false);
+      net.createConnection = vi.fn(() => createSocket(false));
+      // Fake /proc: the launcher (1234) has one child, the gateway worker
+      // 4321. Once the stop has captured it, pid 4321 starts reporting a
+      // DIFFERENT start time: the worker exited and the number was reused.
+      let workerTicks = 100;
+      const stat = (pid, ppid, ticks) =>
+        `${pid} (openclaw-gatewa) S ${ppid} ${"0 ".repeat(17)}${ticks} 0 0\n`;
+      fs.readdirSync = vi.fn((target, ...rest) =>
+        target === "/proc" ? ["1234", "4321"] : originalReaddirSync(target, ...rest),
+      );
+      fs.readFileSync = vi.fn((target, ...rest) => {
+        if (target === "/proc/4321/status") return "Name:\topenclaw-gateway\nPPid:\t1234\n";
+        if (target === "/proc/1234/status") return "Name:\topenclaw\nPPid:\t1\n";
+        if (target === "/proc/4321/stat") return stat(4321, 1234, workerTicks);
+        if (target === "/proc/1234/stat") return stat(1234, 1, 50);
+        return originalReadFileSync(target, ...rest);
+      });
+      const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+      delete require.cache[modulePath];
+      const gateway = require(modulePath);
+      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      await gateway.launchGatewayProcess();
+      vi.useFakeTimers();
+      try {
+        const pending = gateway.stopGatewayChildAndWait({ budgetMs: 20_000 });
+        await vi.advanceTimersByTimeAsync(500);
+        workerTicks = 999; // same pid number, a different process now
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(await pending).toBe(true);
+        await vi.advanceTimersByTimeAsync(25_000);
+        expect(killSpy.mock.calls.filter(([pid]) => pid === 4321)).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("killManagedGatewayChildNow (shutdown-deadline reap) SIGKILLs an adopted supervisor and a direct child alike", async () => {
       const supervisor = createChild();
       childProcess.spawn = vi.fn(() => supervisor);
@@ -4238,19 +4280,23 @@ describe("server/gateway restart behavior", () => {
     // openclaw-ish entries, ascending pid) and filter for gateways AFTER the
     // cap — on a busy host the newest pids (the swapped-in gateway) fell off
     // and a real swap with no port-down sample was recorded incumbent.
-    it("the gateway pid snapshot filters inside the scan and is uncapped: 14 openclaw-ish processes with the new gateway at the highest pid still prove pid replacement", async () => {
+    it("the gateway pid snapshot filters inside the scan and is uncapped: 14 openclaw-ish processes with the new gateway at the highest pid still prove the replacement while an unrelated pre-stop gateway pid survives", async () => {
       vi.useFakeTimers();
       try {
         const doctors = Array.from({ length: 12 }, (_, i) => ({
           pid: 100 + i,
           argv: ["node", "/app/node_modules/openclaw/dist/entry.js", "doctor", "--json"],
         }));
-        let oldGatewayAlive = true;
+        // pid 777 is a gateway this restart cannot attribute to its state dir
+        // (no managed child, no projection): it is not waited on, it survives
+        // the restart, and the verdict must find the NEW gateway at the
+        // highest pid — only an uncapped, filtered scan can.
+        let spawned = false;
+        let portOpen = true;
         const procTable = () => [
           ...doctors,
-          ...(oldGatewayAlive
-            ? [{ pid: 777, argv: ["node", "/app/node_modules/openclaw/dist/entry.js", "gateway", "run"] }]
-            : [{ pid: 5000, argv: ["openclaw", "gateway", "--force"] }]),
+          { pid: 777, argv: ["node", "/app/node_modules/openclaw/dist/entry.js", "gateway", "run"] },
+          ...(spawned ? [{ pid: 5000, argv: ["openclaw", "gateway", "--force"] }] : []),
         ];
         // Honors match/limit exactly like the real /proc scan (see the
         // openclaw-lock-contention unit pins): pid order, cap AFTER match.
@@ -4267,18 +4313,21 @@ describe("server/gateway restart behavior", () => {
         );
         const stampSpy = vi.spyOn(autotune, "stampGatewayEnvApplied").mockReturnValue(null);
         const supervisor = { ...createChild(), pid: 5000 };
-        childProcess.spawn = vi.fn(() => supervisor);
+        childProcess.spawn = vi.fn(() => {
+          spawned = true;
+          portOpen = true;
+          return supervisor;
+        });
         childProcess.execFile = vi.fn((file, args, opts, cb) => {
           if (isStopHelpProbe(args)) return cb(null, kStopHelpWithForce, "");
           if (args?.[0] === "gateway" && args?.[1] === "stop") {
-            // The swap happens between two port polls: no down sample ever.
-            oldGatewayAlive = false;
+            portOpen = false;
             return cb(null, "", "");
           }
           return cb(null, "", "");
         });
         fs.existsSync = vi.fn(() => false);
-        net.createConnection = vi.fn(() => createSocket(true));
+        net.createConnection = vi.fn(() => createSocket(() => portOpen));
         delete require.cache[modulePath];
         const gateway = require(modulePath);
         vi.spyOn(console, "log").mockImplementation(() => {});
@@ -4437,13 +4486,15 @@ describe("server/gateway restart behavior", () => {
             cliExitCode: 1,
             cliForced: false,
             preStopPids: [777],
-            survivingPids: [777],
+            // 777 cannot be attributed to this state dir (no managed child,
+            // no projection), so the port is the release signal here.
+            survivingPids: [],
             phase: "stop_release",
             portOpen: true,
           }),
         });
         expect(error.message).toContain("Gateway restart did not take effect");
-        expect(error.message).toContain("gateway pids 777");
+        expect(error.message).toContain("port never released");
         expect(error.message).toContain("was refused by the CLI");
         const stopping = onStep.mock.calls
           .map(([step]) => step)

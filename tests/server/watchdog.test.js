@@ -15,6 +15,7 @@ const {
   kWatchdogDegradedCheckMaxIntervalMs,
   kWatchdogCheckIntervalMs,
   kGatewayRestartReadyTimeoutMs,
+  kGatewayDrainingReadinessBudgetMs,
   kGatewayRestartOperationBudgetMs,
 } = require("../../lib/server/constants");
 // The tracker's transition table: RT1 asserts a mid-restart answer is
@@ -8123,6 +8124,73 @@ describe("server/watchdog", () => {
         await vi.advanceTimersByTimeAsync(60_000);
         expect(watchdog.getStatus()).toMatchObject({ health: "healthy", readiness: "ready" });
         expect(rowsOfType(insertWatchdogEvent, "readiness_degraded", "ok")).toHaveLength(1);
+        watchdog.stop();
+      });
+
+      it("M5: `draining` gets its own budget (OpenClaw 2026.9.8's 330s stop budget + 15s), longer than the 300s `starting` budget — no incident while a drain runs past 300s", async () => {
+        vi.useFakeTimers();
+        const { control, fetchImpl } = createGatewayControl();
+        control.readyzStatus = "draining";
+        control.ready = false;
+        control.readyzHttpStatus = 503;
+        const { watchdog, insertWatchdogEvent } = createHarness({
+          autoRepair: false,
+          fetchImpl,
+          resolveGatewayReadyzUrl: () => kReadyzUrl,
+        });
+        watchdog.onGatewayLaunch({ startedAt: Date.now(), pid: 100 });
+        await tick();
+        expect(kGatewayDrainingReadinessBudgetMs).toBe(345_000);
+        expect(kGatewayDrainingReadinessBudgetMs).toBeGreaterThan(kGatewayRestartReadyTimeoutMs);
+        // Past the `starting` budget, inside the draining one: still transitional.
+        await vi.advanceTimersByTimeAsync(kGatewayRestartReadyTimeoutMs + 10_000);
+        expect(watchdog.getStatus()).toMatchObject({
+          health: "healthy",
+          readiness: "not_ready",
+          readinessStatus: "draining",
+        });
+        expect(rowsOfType(insertWatchdogEvent, "readiness_degraded", "failed")).toHaveLength(0);
+        // Past the draining budget: a real not_ready, named after its own budget.
+        await vi.advanceTimersByTimeAsync(kGatewayDrainingReadinessBudgetMs - kGatewayRestartReadyTimeoutMs);
+        expect(watchdog.getStatus()).toMatchObject({
+          health: "degraded",
+          readinessStatus: "draining",
+          readinessReason: `draining did not complete within ${kGatewayDrainingReadinessBudgetMs / 1000}s`,
+        });
+        expect(rowsOfType(insertWatchdogEvent, "readiness_degraded", "failed")).toHaveLength(1);
+        watchdog.stop();
+      });
+
+      it("M5: draining → starting restarts the transitional clock — `starting` keeps its own full budget after a long drain", async () => {
+        vi.useFakeTimers();
+        const { control, fetchImpl } = createGatewayControl();
+        control.readyzStatus = "draining";
+        control.ready = false;
+        control.readyzHttpStatus = 503;
+        const { watchdog, insertWatchdogEvent } = createHarness({
+          autoRepair: false,
+          fetchImpl,
+          resolveGatewayReadyzUrl: () => kReadyzUrl,
+        });
+        watchdog.onGatewayLaunch({ startedAt: Date.now(), pid: 100 });
+        await tick();
+        // A 290s drain, then the gateway reports `starting`.
+        await vi.advanceTimersByTimeAsync(290_000);
+        control.readyzStatus = "starting";
+        await vi.advanceTimersByTimeAsync(kGatewayRestartReadyTimeoutMs - 20_000);
+        // 290 + 280 s since the first transitional body, but only 280 s of
+        // `starting`: still transitional, no incident.
+        expect(watchdog.getStatus()).toMatchObject({
+          health: "healthy",
+          readiness: "not_ready",
+          readinessStatus: "starting",
+        });
+        expect(rowsOfType(insertWatchdogEvent, "readiness_degraded", "failed")).toHaveLength(0);
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(watchdog.getStatus()).toMatchObject({
+          health: "degraded",
+          readinessReason: expect.stringContaining("starting did not complete within"),
+        });
         watchdog.stop();
       });
 

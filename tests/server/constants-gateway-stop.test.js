@@ -1,8 +1,10 @@
 // Gateway stop budgets (OpenClaw 2026.9.6+ drain model, refuter finding M2):
 // ALPHACLAW_GATEWAY_STOP_TIMEOUT (restart) and
 // ALPHACLAW_GATEWAY_SHUTDOWN_STOP_TIMEOUT (AlphaClaw exiting) are read at
-// module load, clamped 10-900s, default 345s = upstream's 330s service stop
-// budget (gateway-shutdown-budget.mjs GATEWAY_SERVICE_STOP_TIMEOUT_MS) + 15s.
+// module load, clamped 10-900s. Restart default 345s = upstream's 330s
+// service stop budget (gateway-shutdown-budget.mjs
+// GATEWAY_SERVICE_STOP_TIMEOUT_MS) + 15s; shutdown default 335s = 330 + 5,
+// so the process deadline is 345s and the platform grace floor 360s.
 // Every number that CONTAINS a stop must be derived from them.
 const constantsModulePath = "../../lib/server/constants";
 const { kDeploymentOnlyEnvKeys } = require("../../lib/server/deployment-only-env");
@@ -29,12 +31,15 @@ describe("gateway stop budgets (module-load read)", () => {
     delete require.cache[require.resolve(constantsModulePath)];
   });
 
-  it("defaults both budgets to OpenClaw's 330s service stop budget + 15s, silently", () => {
+  it("defaults: restart 330s + 15s, shutdown 330s + 5s (deadline chain 330 < 335 < 345 < 360), silently", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const c = loadConstants();
     expect(c.kOpenclawGatewayServiceStopBudgetMs).toBe(330_000);
     expect(c.kGatewayStopBudgetMs).toBe(345_000);
-    expect(c.kGatewayShutdownStopBudgetMs).toBe(345_000);
+    expect(c.kGatewayShutdownStopBudgetMs).toBe(335_000);
+    expect(c.kProcessShutdownDeadlineMs).toBe(345_000);
+    expect(c.kPlatformStopGraceFloorMs).toBe(360_000);
+    expect(c.kGatewayDrainingReadinessBudgetMs).toBe(345_000);
     expect(
       warn.mock.calls.map(([line]) => String(line)).filter((line) => line.includes("STOP_TIMEOUT")),
     ).toEqual([]);
