@@ -23,13 +23,29 @@ Versions follow this repository's `package.json` release counter.
   refused (`409 token_env_unset`). `channels.a2a.peer-remove` (dangerous,
   `DELETE /api/channels/a2a/peers/:peerId`) removes a peer and, with
   `removeEnv:true`, its `A2A_*_TOKEN` variable from `.env` when no other peer
-  references it. `channels.a2a.update` (restart, `PUT /api/channels/a2a`) sets
+  references it. `channels.a2a.update` (dangerous, `PUT /api/channels/a2a`) sets
   `advertisedUrl` to an https origin with no path, query or fragment, or
   removes it with `null`. Peer ids are validated against the a2a plugin schema
   (`^[a-z0-9][a-z0-9._-]{0,63}$`). None of the operations creates
   `channels.a2a`: an absent channel is refused (`409 a2a_channel_absent`).
   Writes go through `updateOpenclawConfig` under the `env_sync` lifecycle hold
-  that `PUT /api/env` uses, and mark restart-required.
+  that `PUT /api/env` uses.
+- **peer-upsert is two-phase.** OpenClaw hot-reloads `channels.a2a` and keeps
+  an unresolved `${VAR}` as the literal string, which the channel then accepts
+  as the peer bearer (measured against the pinned 2026.9.8 gateway; pinned by
+  `tests/live/a2a-peer-upsert-hot-reload.e2e.test.js`). The reference is
+  therefore written only when the running gateway was spawned with the
+  variable: `gateway.js` records the env names of every daemon spawn
+  (`lib/server/gateway-launch-env-snapshot.js`). Otherwise the call stages the
+  token, marks restart-required and answers `202` with `state`
+  `token_staged`/`restart_required`, leaving `openclaw.json` untouched; an
+  unknown running env (adopted incumbent) stages too.
+- `token_env_in_use` and `removeEnv` consider every `${VAR}` reference in
+  `openclaw.json` (every peer's `token` and `outboundToken`, and any other
+  string), not only peer tokens.
+- `channels.a2a.update` is dangerous tier: peers send their bearer to the
+  advertised origin.
+- A rejected `tokenEnv` is logged by shape, never by value.
 
 ### Changed
 

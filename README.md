@@ -439,35 +439,40 @@ The real pinned-gateway regression runs with `OPENCLAW_LIVE_E2E=1 npm test -- te
 
 ### Administer the A2A channel through AlphaClaw
 
-Peers and the advertised origin can be changed without editing `openclaw.json` by hand, through the Agent Administration API (the `alphaclaw admin` CLI, or the same `/api` routes from an admin session). Every write goes through AlphaClaw's locked, atomic config writer and marks the gateway restart-required; none of them creates `channels.a2a`, so an absent channel is refused with `409 a2a_channel_absent`. No operation accepts, returns, logs or audits a token value.
+Peers and the advertised origin can be changed without editing `openclaw.json` by hand, through the Agent Administration API (the `alphaclaw admin` CLI, or the same `/api` routes from an admin session). Every write goes through AlphaClaw's locked, atomic config writer; none of them creates `channels.a2a`, so an absent channel is refused with `409 a2a_channel_absent`. No operation accepts, returns, logs or audits a token value.
 
 | Operation | Tier | Request |
 | --- | --- | --- |
 | `channels.a2a.read` | safe | `GET /api/channels/a2a` |
 | `channels.a2a.peer-upsert` | restart | `PUT /api/channels/a2a/peers/<peerId>` with `{"tokenEnv"?, "generate"?}` |
 | `channels.a2a.peer-remove` | dangerous (confirm code) | `DELETE /api/channels/a2a/peers/<peerId>` with `{"removeEnv"?}` |
-| `channels.a2a.update` | restart | `PUT /api/channels/a2a` with `{"advertisedUrl": "<https origin>" or null}` |
+| `channels.a2a.update` | dangerous (confirm code) | `PUT /api/channels/a2a` with `{"advertisedUrl": "<https origin>" or null}` |
 
 ```bash
 # Read: enabled, exposeAgents, advertisedUrl, replyTimeoutMs and each peer as
 # {id, tokenRef, tokenEnv, tokenEnvSet}; a plaintext token reads as "literal".
 alphaclaw admin GET /api/channels/a2a --json
 
-# Add a peer whose token AlphaClaw generates (256 bits, base64url) into its
-# .env as A2A_HERMES_TOKEN, then point peers.hermes.token at "${A2A_HERMES_TOKEN}".
+# Add a peer in two phases. The first call generates a token (256 bits,
+# base64url) into AlphaClaw's .env as A2A_HERMES_TOKEN and answers 202
+# {"state":"token_staged"}; openclaw.json is not touched. Restart the gateway,
+# then repeat the call: it answers {"state":"applied"} and points
+# peers.hermes.token at "${A2A_HERMES_TOKEN}".
+echo '{"generate":true}' | alphaclaw admin PUT /api/channels/a2a/peers/hermes --data-stdin
+alphaclaw admin POST /api/gateway/restart --confirm ABCD-EFGH   # dangerous: confirm code
 echo '{"generate":true}' | alphaclaw admin PUT /api/channels/a2a/peers/hermes --data-stdin
 
 # Point a peer at a variable that is already set (deployment env or .env).
 echo '{"tokenEnv":"A2A_CLAUDE_HOST_TOKEN"}' | alphaclaw admin PUT /api/channels/a2a/peers/claude-host --data-stdin
 
-# Set or unset the advertised origin.
-echo '{"advertisedUrl":"https://your-alphaclaw.example.com"}' | alphaclaw admin PUT /api/channels/a2a --data-stdin
+# Set or unset the advertised origin (dangerous: one-time confirm code).
+echo '{"advertisedUrl":"https://your-alphaclaw.example.com"}' | alphaclaw admin PUT /api/channels/a2a --data-stdin --confirm ABCD-EFGH
 
 # Remove a peer and its A2A_*_TOKEN variable (dangerous: one-time confirm code).
 echo '{"removeEnv":true}' | alphaclaw admin DELETE /api/channels/a2a/peers/hermes --data-stdin --confirm ABCD-EFGH
 ```
 
-Peer ids follow the OpenClaw a2a schema, `^[a-z0-9][a-z0-9._-]{0,63}$`. `tokenEnv` must match `^A2A_[A-Z0-9_]+_TOKEN$` and defaults to `A2A_<PEERID>_TOKEN` (uppercased, `.` and `-` become `_`); a variable another peer already uses is refused. Without `generate:true` an unset variable is refused with `409 token_env_unset` rather than writing a reference OpenClaw cannot resolve. An upsert keeps the peer's other fields (`url`, `outboundToken`) and replaces a plaintext `token` with the reference. `removeEnv` deletes the variable only from AlphaClaw's `.env`, only in the `A2A_*_TOKEN` shape, and only when no other peer references it; a deployment-environment value is reported, not removed. The generated value is visible to admins in the Envars tab, from where it is handed to the peer. Every variable matching `^A2A_[A-Z0-9_]+_TOKEN$` is forwarded to the gateway child by the built-in allowlist in `lib/server/gateway-env-policy.js`, so no `ALPHACLAW_GATEWAY_ENV_PASSTHROUGH` entry is needed for it.
+Peer ids follow the OpenClaw a2a schema, `^[a-z0-9][a-z0-9._-]{0,63}$`. `tokenEnv` must match `^A2A_[A-Z0-9_]+_TOKEN$` and defaults to `A2A_<PEERID>_TOKEN` (uppercased, `.` and `-` become `_`); a variable referenced anywhere else in `openclaw.json` (another peer's `token` or `outboundToken`, or any other `${VAR}` reference) is refused. Without `generate:true` an unset variable is refused with `409 token_env_unset`. **The reference is written only when the running gateway was spawned with the variable.** OpenClaw hot-reloads `channels.a2a` and resolves `${VAR}` from the gateway's own environment; a variable the running gateway lacks stays the literal string `${VAR}`, which the channel then accepts as the peer's bearer. So a token generated, or set with `env.update`, after the gateway started is staged: the call answers `202` with `state` `token_staged` or `restart_required`, marks the gateway restart-required and leaves `openclaw.json` untouched, and the same call after the restart applies it. When AlphaClaw adopted a gateway it did not spawn, the gateway's environment is unknown and the call stages too. An applied change takes effect by hot reload, without a restart; so does a removal, within about a second. An upsert keeps the peer's other fields (`url`, `outboundToken`) and replaces a plaintext `token` with the reference. `removeEnv` deletes the variable only from AlphaClaw's `.env`, only in the `A2A_*_TOKEN` shape, and only when nothing else in `openclaw.json` references it; a deployment-environment value is reported, not removed. The generated value is visible to admins in the Envars tab, from where it is handed to the peer. Every variable matching `^A2A_[A-Z0-9_]+_TOKEN$` is forwarded to the gateway child by the built-in allowlist in `lib/server/gateway-env-policy.js`, so no `ALPHACLAW_GATEWAY_ENV_PASSTHROUGH` entry is needed for it.
 
 ## Security Notes
 

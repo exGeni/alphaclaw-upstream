@@ -24,6 +24,8 @@ describe("server/routes/a2a (channels.a2a administration)", () => {
   let lock;
   let logSpy;
   let warnSpy;
+  // Names in the env the running gateway was spawned with (null = unknown).
+  let launchKeys;
 
   const configPath = () => path.join(openclawDir, "openclaw.json");
   const writeConfig = (cfg) => fs.writeFileSync(configPath(), JSON.stringify(cfg, null, 2));
@@ -37,6 +39,7 @@ describe("server/routes/a2a (channels.a2a administration)", () => {
     openclawDir = fs.mkdtempSync(path.join(os.tmpdir(), "a2a-routes-"));
     envVars = [];
     processEnv = {};
+    launchKeys = new Set();
     restartRequiredState = { markRequired: vi.fn() };
     lock = {
       held: 0,
@@ -78,6 +81,7 @@ describe("server/routes/a2a (channels.a2a administration)", () => {
       },
       restartRequiredState,
       gatewayLifecycleLock: lock,
+      getGatewayLaunchEnvKeys: () => launchKeys,
     });
     const app = express();
     app.use(express.json());
@@ -168,30 +172,84 @@ describe("server/routes/a2a (channels.a2a administration)", () => {
   });
 
   describe("PUT /api/channels/a2a/peers/:peerId (channels.a2a.peer-upsert)", () => {
-    it("generates a token into the env store and writes a ${VAR} reference", async () => {
+    it("two-phase: generate stages the token (202, config untouched); the repeat after a restart writes the ${VAR} reference", async () => {
       writeConfig(baseConfig({ enabled: true, peers: {} }));
-      const res = await request(createApp())
+      const before = fs.readFileSync(configPath(), "utf8");
+      const app = createApp();
+      const staged = await request(app)
         .put("/api/channels/a2a/peers/new-peer")
         .send({ generate: true });
-      expect(res.status).toBe(201);
-      expect(res.body).toEqual({
+      expect(staged.status).toBe(202);
+      expect(staged.body).toEqual({
         ok: true,
+        state: "token_staged",
+        reason: "token_env_generated",
+        next: "Restart the gateway, then call channels.a2a.peer-upsert again with the same body.",
         peer: { id: "new-peer", tokenRef: "env", tokenEnv: "A2A_NEW_PEER_TOKEN", tokenEnvSet: true },
-        created: true,
+        created: false,
         tokenGenerated: true,
         changed: true,
         restartRequired: true,
       });
       expect(envVars).toEqual([{ key: "A2A_NEW_PEER_TOKEN", value: kFakeToken }]);
       expect(processEnv.A2A_NEW_PEER_TOKEN).toBe(kFakeToken);
+      // B1: no reference reaches openclaw.json while the running gateway
+      // lacks the variable (a hot reload would keep the literal as bearer).
+      expect(fs.readFileSync(configPath(), "utf8")).toBe(before);
+      expect(restartRequiredState.markRequired).toHaveBeenCalledWith("a2a_token_env_staged");
+
+      // The gateway restarts with the staged variable in its env.
+      launchKeys = new Set(["PATH", "A2A_NEW_PEER_TOKEN"]);
+      const applied = await request(app)
+        .put("/api/channels/a2a/peers/new-peer")
+        .send({ generate: true });
+      expect(applied.status).toBe(201);
+      expect(applied.body).toEqual({
+        ok: true,
+        state: "applied",
+        peer: { id: "new-peer", tokenRef: "env", tokenEnv: "A2A_NEW_PEER_TOKEN", tokenEnvSet: true },
+        created: true,
+        tokenGenerated: false,
+        changed: true,
+        restartRequired: false,
+      });
+      expect(envVars).toEqual([{ key: "A2A_NEW_PEER_TOKEN", value: kFakeToken }]);
       expect(readConfig().channels.a2a.peers).toEqual({
         "new-peer": { token: "${A2A_NEW_PEER_TOKEN}" },
       });
       expect(readConfig().channels.telegram).toEqual({ enabled: true });
-      expect(restartRequiredState.markRequired).toHaveBeenCalledWith("a2a_peers_changed");
-      expect(lock.kinds).toEqual(["env_sync"]);
+      expect(lock.kinds).toEqual(["env_sync", "env_sync"]);
       expect(lock.held).toBe(0);
-      expectNoTokenLeak(res.body, readConfig());
+      expectNoTokenLeak(staged.body, applied.body, readConfig());
+    });
+
+    it("B1: a variable set (env.update) but absent from the running gateway is not referenced yet", async () => {
+      writeConfig(baseConfig({ enabled: true }));
+      envVars = [{ key: "A2A_HERMES_TOKEN", value: "set-after-spawn" }];
+      launchKeys = new Set(["PATH"]);
+      const before = fs.readFileSync(configPath(), "utf8");
+      const res = await request(createApp()).put("/api/channels/a2a/peers/hermes").send({});
+      expect(res.status).toBe(202);
+      expect(res.body).toMatchObject({
+        state: "restart_required",
+        reason: "token_env_not_in_running_gateway",
+        tokenGenerated: false,
+        changed: false,
+        restartRequired: true,
+      });
+      expect(fs.readFileSync(configPath(), "utf8")).toBe(before);
+      expect(restartRequiredState.markRequired).toHaveBeenCalledWith("a2a_token_env_staged");
+    });
+
+    it("B1: an unknown running-gateway env (adopted incumbent) fails closed", async () => {
+      writeConfig(baseConfig({ enabled: true }));
+      processEnv.A2A_HERMES_TOKEN = "x";
+      launchKeys = null;
+      const before = fs.readFileSync(configPath(), "utf8");
+      const res = await request(createApp()).put("/api/channels/a2a/peers/hermes").send({});
+      expect(res.status).toBe(202);
+      expect(res.body).toMatchObject({ state: "restart_required", reason: "running_gateway_env_unknown" });
+      expect(fs.readFileSync(configPath(), "utf8")).toBe(before);
     });
 
     it("keeps an existing env value and the peer's other fields", async () => {
@@ -202,11 +260,12 @@ describe("server/routes/a2a (channels.a2a administration)", () => {
         }),
       );
       envVars = [{ key: "A2A_HERMES_TOKEN", value: "already-there" }];
+      launchKeys = new Set(["A2A_HERMES_TOKEN"]);
       const res = await request(createApp())
         .put("/api/channels/a2a/peers/hermes")
         .send({ generate: true });
       expect(res.status).toBe(200);
-      expect(res.body).toMatchObject({ created: false, tokenGenerated: false, changed: true });
+      expect(res.body).toMatchObject({ state: "applied", created: false, tokenGenerated: false, changed: true });
       expect(envVars).toEqual([{ key: "A2A_HERMES_TOKEN", value: "already-there" }]);
       expect(readConfig().channels.a2a.peers.hermes).toEqual({
         token: "${A2A_HERMES_TOKEN}",
@@ -218,6 +277,7 @@ describe("server/routes/a2a (channels.a2a administration)", () => {
     it("honours an explicit tokenEnv set in the deployment env", async () => {
       writeConfig(baseConfig({ enabled: true }));
       processEnv.A2A_CLAUDE_HOST_TOKEN = "deployment-env-value";
+      launchKeys = new Set(["A2A_CLAUDE_HOST_TOKEN"]);
       const res = await request(createApp())
         .put("/api/channels/a2a/peers/claude.host")
         .send({ tokenEnv: "A2A_CLAUDE_HOST_TOKEN" });
@@ -237,6 +297,7 @@ describe("server/routes/a2a (channels.a2a administration)", () => {
     it("is a no-op (no write, no restart) when the reference is already in place", async () => {
       writeConfig(baseConfig({ enabled: true, peers: { hermes: { token: "${A2A_HERMES_TOKEN}" } } }));
       processEnv.A2A_HERMES_TOKEN = "x";
+      launchKeys = new Set(["A2A_HERMES_TOKEN"]);
       const before = fs.statSync(configPath()).mtimeMs;
       const res = await request(createApp()).put("/api/channels/a2a/peers/hermes").send({});
       expect(res.status).toBe(200);
@@ -279,6 +340,36 @@ describe("server/routes/a2a (channels.a2a administration)", () => {
     });
 
     it.each([
+      [
+        "another peer's outboundToken",
+        { channels: { a2a: { enabled: true, peers: { b: { token: "${A2A_B_TOKEN}", outboundToken: "${A2A_X_TOKEN}" } } } } },
+      ],
+      [
+        "the same peer's outboundToken",
+        { channels: { a2a: { enabled: true, peers: { x: { token: "lit", outboundToken: "${A2A_X_TOKEN}" } } } } },
+      ],
+      [
+        "an inline reference elsewhere in openclaw.json",
+        { channels: { a2a: { enabled: true } }, mcp: { servers: { r: { headers: { Authorization: "Bearer ${A2A_X_TOKEN}" } } } } },
+      ],
+    ])("M1: refuses a tokenEnv referenced by %s", async (_label, cfg) => {
+      writeConfig(cfg);
+      processEnv.A2A_X_TOKEN = "x";
+      launchKeys = new Set(["A2A_X_TOKEN"]);
+      const res = await request(createApp()).put("/api/channels/a2a/peers/x").send({});
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe("token_env_in_use");
+    });
+
+    it("M1: an escaped $${VAR} literal is not a reference", async () => {
+      writeConfig({ channels: { a2a: { enabled: true } }, notes: { text: "$${A2A_X_TOKEN}" } });
+      processEnv.A2A_X_TOKEN = "x";
+      launchKeys = new Set(["A2A_X_TOKEN"]);
+      const res = await request(createApp()).put("/api/channels/a2a/peers/x").send({});
+      expect(res.status).toBe(201);
+    });
+
+    it.each([
       ["Upper", "uppercase"],
       ["-lead", "leading hyphen"],
       ["a".repeat(65), "too long"],
@@ -306,6 +397,18 @@ describe("server/routes/a2a (channels.a2a administration)", () => {
         expect(envVars).toEqual([]);
       },
     );
+
+    it("m1: a rejected tokenEnv is logged by shape, never by value", async () => {
+      writeConfig(baseConfig({ enabled: true }));
+      const res = await request(createApp())
+        .put("/api/channels/a2a/peers/hermes")
+        .send({ tokenEnv: "sk-pasted-Secret9" });
+      expect(res.status).toBe(400);
+      const lines = warnSpy.mock.calls.map((call) => call.map(String).join(" "));
+      const inputLine = lines.find((line) => line.includes("field=tokenEnv"));
+      expect(inputLine).toContain("<string:upper+lower+digit+other>");
+      for (const line of lines) expect(line).not.toContain("pasted");
+    });
 
     it("rejects a token value in the body", async () => {
       writeConfig(baseConfig({ enabled: true }));
@@ -404,6 +507,28 @@ describe("server/routes/a2a (channels.a2a administration)", () => {
         reason: "referenced_by_other_peer",
       });
       expect(envVars).toHaveLength(1);
+    });
+
+    it("M1/Codex P2: removeEnv keeps a variable another peer's outboundToken references", async () => {
+      writeConfig(
+        baseConfig({
+          enabled: true,
+          peers: {
+            a: { token: "${A2A_SHARED_TOKEN}" },
+            b: { token: "${A2A_B_TOKEN}", outboundToken: "${A2A_SHARED_TOKEN}" },
+          },
+        }),
+      );
+      envVars = [{ key: "A2A_SHARED_TOKEN", value: "s" }];
+      const res = await request(createApp())
+        .delete("/api/channels/a2a/peers/a")
+        .send({ removeEnv: true });
+      expect(res.body.env).toEqual({
+        name: "A2A_SHARED_TOKEN",
+        removed: false,
+        reason: "referenced_by_other_peer",
+      });
+      expect(envVars).toEqual([{ key: "A2A_SHARED_TOKEN", value: "s" }]);
     });
 
     it("removeEnv on a literal token reports it without echoing the value", async () => {

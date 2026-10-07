@@ -16,6 +16,10 @@ const { gatewayEnv } = require("../../lib/server/gateway");
 const { createA2aChannelService } = require("../../lib/server/a2a-channel");
 const { readEnvFile } = require("../../lib/server/env");
 const {
+  recordGatewayLaunchEnv,
+  resetGatewayLaunchEnvForTests,
+} = require("../../lib/server/gateway-launch-env-snapshot");
+const {
   filterGatewayChildEnv,
   resetGatewayEnvPolicyForTests,
 } = require("../../lib/server/gateway-env-policy");
@@ -25,10 +29,11 @@ describe("A2A peer token reaches the gateway child env", () => {
   afterEach(() => {
     delete process.env[kVar];
     resetGatewayEnvPolicyForTests();
+    resetGatewayLaunchEnvForTests();
   });
   afterAll(() => fs.rmSync(kTempRoot, { recursive: true, force: true }));
 
-  it("generate:true writes .env (0600) and gatewayEnv() forwards the variable", async () => {
+  it("generate:true stages .env (0600); gatewayEnv() forwards it; the reference lands only after a launch with it", async () => {
     fs.writeFileSync(
       path.join(kOpenclawDir, "openclaw.json"),
       JSON.stringify({ channels: { a2a: { enabled: true, peers: {} } } }),
@@ -45,10 +50,18 @@ describe("A2A peer token reaches the gateway child env", () => {
       for (const call of logSpy.mock.calls) {
         expect(call.map(String).join(" ")).not.toContain(stored.value);
       }
+      expect(result.state).toBe("token_staged");
+      const readCfg = () =>
+        JSON.parse(fs.readFileSync(path.join(kOpenclawDir, "openclaw.json"), "utf8"));
+      expect(readCfg().channels.a2a.peers).toEqual({});
       const env = gatewayEnv();
       expect(env[kVar]).toBe(stored.value);
-      const config = JSON.parse(fs.readFileSync(path.join(kOpenclawDir, "openclaw.json"), "utf8"));
-      expect(config.channels.a2a.peers["itest-peer"]).toEqual({ token: `\${${kVar}}` });
+      // What gateway.js does at a daemon spawn with that env.
+      recordGatewayLaunchEnv(env);
+      const applied = await service.upsertPeer("itest-peer", { generate: true });
+      expect(applied.state).toBe("applied");
+      expect(applied.tokenGenerated).toBe(false);
+      expect(readCfg().channels.a2a.peers["itest-peer"]).toEqual({ token: `\${${kVar}}` });
     } finally {
       logSpy.mockRestore();
     }

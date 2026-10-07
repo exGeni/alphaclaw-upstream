@@ -793,7 +793,8 @@ describe("admin-manifest channels.a2a ops", () => {
   it("classifies the four A2A routes with their tiers and restart marks", () => {
     const expectations = [
       ["GET", "/api/channels/a2a", "channels.a2a.read", "safe", "none"],
-      ["PUT", "/api/channels/a2a", "channels.a2a.update", "restart", "marks"],
+      // Codex P1: the advertised origin receives peers' bearer tokens.
+      ["PUT", "/api/channels/a2a", "channels.a2a.update", "dangerous", "marks"],
       ["PUT", "/api/channels/a2a/peers/hermes", "channels.a2a.peer-upsert", "restart", "marks"],
       ["DELETE", "/api/channels/a2a/peers/claude.host", "channels.a2a.peer-remove", "dangerous", "marks"],
     ];

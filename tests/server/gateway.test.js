@@ -200,6 +200,56 @@ describe("server/gateway restart behavior", () => {
     expect(launchHandler).not.toHaveBeenCalled();
   });
 
+  it("records the env names of every daemon spawn (launch and cold restart) for the A2A two-phase gate", async () => {
+    const snapshot = require("../../lib/server/gateway-launch-env-snapshot");
+    snapshot.resetGatewayLaunchEnvForTests();
+    const managedChild = createChild();
+    const restartSupervisor = createChild();
+    let gatewayPortOpen = false;
+    const spawnMock = vi.fn((file, args) => {
+      if (args?.[0] === "gateway" && args?.[1] === "--force") {
+        queueMicrotask(() => {
+          gatewayPortOpen = true;
+        });
+        return restartSupervisor;
+      }
+      return managedChild;
+    });
+    childProcess.spawn = spawnMock;
+    childProcess.execSync = vi.fn(() => "");
+    fs.existsSync = vi.fn(() => true);
+    net.createConnection = vi.fn(() => createSocket(() => gatewayPortOpen));
+    childProcess.execFile = vi.fn((file, args, opts, cb) => {
+      if (args?.[0] === "gateway" && args?.[1] === "stop") gatewayPortOpen = false;
+      cb(null, "", "");
+    });
+    delete require.cache[modulePath];
+    const gateway = require(modulePath);
+    fs.readFileSync = vi.fn(() => JSON.stringify({}));
+    const saved = process.env.A2A_SPAWNTEST_TOKEN;
+    delete process.env.A2A_SPAWNTEST_TOKEN;
+    try {
+      expect(snapshot.getGatewayLaunchEnvKeys()).toBeNull();
+      await gateway.startGateway();
+      const firstSpawnEnv = spawnMock.mock.calls[0][2].env;
+      expect(snapshot.getGatewayLaunchEnvKeys()).toEqual(
+        new Set(Object.keys(firstSpawnEnv).filter((k) => firstSpawnEnv[k] !== "")),
+      );
+      expect(snapshot.getGatewayLaunchEnvKeys().has("A2A_SPAWNTEST_TOKEN")).toBe(false);
+
+      process.env.A2A_SPAWNTEST_TOKEN = "staged";
+      gatewayPortOpen = true;
+      await gateway.restartGateway(vi.fn());
+      expect(spawnMock.mock.calls[1][1]).toEqual(["gateway", "--force"]);
+      expect(spawnMock.mock.calls[1][2].env.A2A_SPAWNTEST_TOKEN).toBe("staged");
+      expect(snapshot.getGatewayLaunchEnvKeys().has("A2A_SPAWNTEST_TOKEN")).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.A2A_SPAWNTEST_TOKEN;
+      else process.env.A2A_SPAWNTEST_TOKEN = saved;
+      snapshot.resetGatewayLaunchEnvForTests();
+    }
+  });
+
   it("always cold-starts when the gateway port is listening", async () => {
     const managedChild = createChild();
     const restartSupervisor = createChild();
