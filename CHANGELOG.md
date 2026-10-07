@@ -5,6 +5,40 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.9.99-exgenius.10] - 2026-10-07
+
+### Added
+
+- **A2A channel administration as Agent Administration operations.**
+  `channels.a2a.read` (safe, `GET /api/channels/a2a`) reports `enabled`,
+  `exposeAgents`, `advertisedUrl`, `replyTimeoutMs`/`rateLimitPerMinute` when
+  present, and each peer as `{id, tokenRef, tokenEnv, tokenEnvSet}`: a token is
+  reported by kind (`env`, `literal`, `missing`, `unsupported`) and env
+  presence, never by value. `channels.a2a.peer-upsert` (restart,
+  `PUT /api/channels/a2a/peers/:peerId`) points `peers.<id>.token` at
+  `${A2A_<ID>_TOKEN}` (or a given `tokenEnv` matching `^A2A_[A-Z0-9_]+_TOKEN$`),
+  keeping the peer's other fields; with `generate:true` and the variable unset
+  it generates a 256-bit base64url token into AlphaClaw's `.env` without
+  returning, logging or auditing it, and without it an unset variable is
+  refused (`409 token_env_unset`). `channels.a2a.peer-remove` (dangerous,
+  `DELETE /api/channels/a2a/peers/:peerId`) removes a peer and, with
+  `removeEnv:true`, its `A2A_*_TOKEN` variable from `.env` when no other peer
+  references it. `channels.a2a.update` (restart, `PUT /api/channels/a2a`) sets
+  `advertisedUrl` to an https origin with no path, query or fragment, or
+  removes it with `null`. Peer ids are validated against the a2a plugin schema
+  (`^[a-z0-9][a-z0-9._-]{0,63}$`). None of the operations creates
+  `channels.a2a`: an absent channel is refused (`409 a2a_channel_absent`).
+  Writes go through `updateOpenclawConfig` under the `env_sync` lifecycle hold
+  that `PUT /api/env` uses, and mark restart-required.
+
+### Changed
+
+- **The gateway child env allowlist forwards `^A2A_[A-Z0-9_]+_TOKEN$`.**
+  OpenClaw resolves `channels.a2a.peers.<id>.token` from the gateway child
+  env; these names were previously withheld unless the deployment env listed
+  them in `ALPHACLAW_GATEWAY_ENV_PASSTHROUGH`. They are the gateway's own
+  ingress credentials, the same class as `WEBHOOK_TOKEN`.
+
 ## [0.9.99-exgenius.9] - 2026-10-04
 
 exGeni fork line rebuilt on upstream **v0.9.99** (`garrytan/alphaclaw` main

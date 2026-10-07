@@ -437,6 +437,38 @@ For long tasks, use `SendMessage` with `params.configuration.returnImmediately: 
 
 The real pinned-gateway regression runs with `OPENCLAW_LIVE_E2E=1 npm test -- tests/live/proxy-a2a.e2e.test.js --no-file-parallelism`. It exercises the full AlphaClaw HTTP proxy and real A2A auth/task lifecycle with a local deterministic model endpoint, without external model credentials.
 
+### Administer the A2A channel through AlphaClaw
+
+Peers and the advertised origin can be changed without editing `openclaw.json` by hand, through the Agent Administration API (the `alphaclaw admin` CLI, or the same `/api` routes from an admin session). Every write goes through AlphaClaw's locked, atomic config writer and marks the gateway restart-required; none of them creates `channels.a2a`, so an absent channel is refused with `409 a2a_channel_absent`. No operation accepts, returns, logs or audits a token value.
+
+| Operation | Tier | Request |
+| --- | --- | --- |
+| `channels.a2a.read` | safe | `GET /api/channels/a2a` |
+| `channels.a2a.peer-upsert` | restart | `PUT /api/channels/a2a/peers/<peerId>` with `{"tokenEnv"?, "generate"?}` |
+| `channels.a2a.peer-remove` | dangerous (confirm code) | `DELETE /api/channels/a2a/peers/<peerId>` with `{"removeEnv"?}` |
+| `channels.a2a.update` | restart | `PUT /api/channels/a2a` with `{"advertisedUrl": "<https origin>" or null}` |
+
+```bash
+# Read: enabled, exposeAgents, advertisedUrl, replyTimeoutMs and each peer as
+# {id, tokenRef, tokenEnv, tokenEnvSet}; a plaintext token reads as "literal".
+alphaclaw admin GET /api/channels/a2a --json
+
+# Add a peer whose token AlphaClaw generates (256 bits, base64url) into its
+# .env as A2A_HERMES_TOKEN, then point peers.hermes.token at "${A2A_HERMES_TOKEN}".
+echo '{"generate":true}' | alphaclaw admin PUT /api/channels/a2a/peers/hermes --data-stdin
+
+# Point a peer at a variable that is already set (deployment env or .env).
+echo '{"tokenEnv":"A2A_CLAUDE_HOST_TOKEN"}' | alphaclaw admin PUT /api/channels/a2a/peers/claude-host --data-stdin
+
+# Set or unset the advertised origin.
+echo '{"advertisedUrl":"https://your-alphaclaw.example.com"}' | alphaclaw admin PUT /api/channels/a2a --data-stdin
+
+# Remove a peer and its A2A_*_TOKEN variable (dangerous: one-time confirm code).
+echo '{"removeEnv":true}' | alphaclaw admin DELETE /api/channels/a2a/peers/hermes --data-stdin --confirm ABCD-EFGH
+```
+
+Peer ids follow the OpenClaw a2a schema, `^[a-z0-9][a-z0-9._-]{0,63}$`. `tokenEnv` must match `^A2A_[A-Z0-9_]+_TOKEN$` and defaults to `A2A_<PEERID>_TOKEN` (uppercased, `.` and `-` become `_`); a variable another peer already uses is refused. Without `generate:true` an unset variable is refused with `409 token_env_unset` rather than writing a reference OpenClaw cannot resolve. An upsert keeps the peer's other fields (`url`, `outboundToken`) and replaces a plaintext `token` with the reference. `removeEnv` deletes the variable only from AlphaClaw's `.env`, only in the `A2A_*_TOKEN` shape, and only when no other peer references it; a deployment-environment value is reported, not removed. The generated value is visible to admins in the Envars tab, from where it is handed to the peer. Every variable matching `^A2A_[A-Z0-9_]+_TOKEN$` is forwarded to the gateway child by the built-in allowlist in `lib/server/gateway-env-policy.js`, so no `ALPHACLAW_GATEWAY_ENV_PASSTHROUGH` entry is needed for it.
+
 ## Security Notes
 
 AlphaClaw is a convenience wrapper — it intentionally trades some of OpenClaw's default hardening for ease of setup. You should understand what's different:

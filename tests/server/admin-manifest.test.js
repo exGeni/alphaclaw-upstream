@@ -788,3 +788,27 @@ describe("agents.update tools tier", () => {
     }
   });
 });
+
+describe("admin-manifest channels.a2a ops", () => {
+  it("classifies the four A2A routes with their tiers and restart marks", () => {
+    const expectations = [
+      ["GET", "/api/channels/a2a", "channels.a2a.read", "safe", "none"],
+      ["PUT", "/api/channels/a2a", "channels.a2a.update", "restart", "marks"],
+      ["PUT", "/api/channels/a2a/peers/hermes", "channels.a2a.peer-upsert", "restart", "marks"],
+      ["DELETE", "/api/channels/a2a/peers/claude.host", "channels.a2a.peer-remove", "dangerous", "marks"],
+    ];
+    for (const [method, fullPath, id, tier, restart] of expectations) {
+      const ops = manifest.findAllOps(method, fullPath);
+      expect(ops.map((op) => op.id)).toEqual([id]);
+      expect(ops[0].tier).toBe(tier);
+      expect(ops[0].restart).toBe(restart);
+      expect(manifest.resolveTier(ops[0], { body: {} })).toBe(tier);
+    }
+  });
+
+  it("never names a token value field, only the env variable name", () => {
+    const upsert = manifest.listOps().find((op) => op.id === "channels.a2a.peer-upsert");
+    expect(upsert.params.fields.map((f) => f.name).sort()).toEqual(["generate", "peerId", "tokenEnv"]);
+    expect(upsert.readOp).toBe("channels.a2a.read");
+  });
+});
