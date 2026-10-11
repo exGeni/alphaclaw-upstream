@@ -1,8 +1,12 @@
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 const {
   createWatchdog,
   kRestartFailureRecheckDelaysMs,
   kRestartFailureNoteTtlMs,
 } = require("../../lib/server/watchdog");
+const { createWatchdogIncidentTracker } = require("../../lib/server/watchdog-incidents");
 
 // Bug #137 — the failed-restart handoff: the route files ONE note
 // (noteRestartFailure) after a restart ends with the gateway actually down;
@@ -38,23 +42,58 @@ const createHarness = ({
   getOpenclawInfo = null,
   supervisorModeActive = () => false,
   consumeRestartHandoffImpl = null,
+  onRestartFailureRecovered = null,
+  // Cause linkage (PR 2): route the sink through a real incident tracker on
+  // a scratch watchdog db (server.js wiring) and answer /readyz too.
+  trackIncidents = false,
 } = {}) => {
   process.env.WATCHDOG_AUTO_REPAIR = autoRepair ? "true" : "false";
   process.env.WATCHDOG_NOTIFICATIONS_DISABLED = "true";
-  // The port under test: `healthy` flips what /health answers.
-  const control = { healthy: true };
-  global.fetch = vi.fn(async () => {
+  // The port under test: `healthy` flips what /health answers; with
+  // trackIncidents, `readyzFailing` names the components /readyz reports.
+  const control = { healthy: true, readyzFailing: [] };
+  global.fetch = vi.fn(async (url) => {
     if (!control.healthy) throw new Error("connect ECONNREFUSED");
+    if (String(url).includes("readyz")) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            ready: control.readyzFailing.length === 0,
+            failing: control.readyzFailing,
+            eventLoop: { degraded: false },
+          }),
+      };
+    }
     return {
       ok: true,
       status: 200,
       text: async () => JSON.stringify({ ok: true, status: "live" }),
     };
   });
-  const insertWatchdogEvent = vi.fn();
+  let db = null;
+  let watchdog = null;
+  if (trackIncidents) {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "watchdog-restart-failure-"));
+    const modulePath = require.resolve("../../lib/server/db/watchdog");
+    delete require.cache[modulePath];
+    db = require(modulePath);
+    db.initWatchdogDb({ rootDir, pruneDays: 30 });
+    openIncidentDbs.push({ db, rootDir });
+  }
+  const tracker = trackIncidents
+    ? createWatchdogIncidentTracker({
+        db,
+        getStatus: () => watchdog?.getStatus?.() ?? null,
+        getResourceSample: () => null,
+        logger: { error: () => {}, info: () => {}, log: () => {} },
+      })
+    : null;
+  const insertWatchdogEvent = vi.fn(tracker ? tracker.wrapInsertEvent(db.insertWatchdogEvent) : () => {});
   const clawCmd = vi.fn(clawCmdImpl);
   const launchGatewayProcess = vi.fn(() => ({ pid: 4242 }));
-  const watchdog = createWatchdog({
+  watchdog = createWatchdog({
     clawCmd,
     launchGatewayProcess,
     gatewayLifecycleLock,
@@ -65,7 +104,7 @@ const createHarness = ({
     reloadEnv: vi.fn(),
     resolveSetupUrl: () => "https://setup.example.com",
     resolveGatewayHealthUrl: () => "http://127.0.0.1:18789/health",
-    resolveGatewayReadyzUrl: () => "",
+    resolveGatewayReadyzUrl: () => (trackIncidents ? "http://127.0.0.1:18789/readyz" : ""),
     sleepImpl: () => Promise.resolve(),
     supervisorModeActive,
     ...(consumeRestartHandoffImpl ? { consumeRestartHandoffImpl } : {}),
@@ -73,6 +112,7 @@ const createHarness = ({
     ...(pidAlive ? { pidAlive } : {}),
     ...(readPersistedPause ? { readPersistedPause, writePersistedPause: vi.fn() } : {}),
     ...(getOpenclawInfo ? { getOpenclawInfo } : {}),
+    ...(onRestartFailureRecovered ? { onRestartFailureRecovered } : {}),
   });
   const rows = () => insertWatchdogEvent.mock.calls.map(([row]) => row);
   const rowsOf = (eventType, status = null, source = null) =>
@@ -102,6 +142,8 @@ const createHarness = ({
   return {
     watchdog,
     control,
+    db,
+    tracker,
     insertWatchdogEvent,
     clawCmd,
     launchGatewayProcess,
@@ -112,6 +154,8 @@ const createHarness = ({
     failUserRestart,
   };
 };
+
+const openIncidentDbs = [];
 
 const kPersistedPause = {
   at: 1788681900000,
@@ -131,6 +175,10 @@ describe("watchdog failed-restart handoff (bug #137)", () => {
     else process.env.WATCHDOG_NOTIFICATIONS_DISABLED = kOriginalNotificationsDisabled;
     if (kOriginalFetch == null) delete global.fetch;
     else global.fetch = kOriginalFetch;
+    for (const { db, rootDir } of openIncidentDbs.splice(0)) {
+      db.closeWatchdogDb?.();
+      fs.rmSync(rootDir, { recursive: true, force: true });
+    }
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -581,6 +629,46 @@ describe("watchdog failed-restart handoff (bug #137)", () => {
       h2.watchdog.stop();
     });
 
+    it("the recovery hook (PR 2) receives the verdict once per note: watchdog_repair with the relaunch time, restart_child for a ready_timeout whose own child came up, unknown otherwise; a throwing hook is contained", async () => {
+      vi.useFakeTimers();
+      const hook = vi.fn();
+      const h = createHarness({ onRestartFailureRecovered: hook });
+      await h.failUserRestart();
+      h.watchdog.noteRestartFailure({ operationId: "op-1", code: "stop_failed", gatewayDown: true });
+      h.watchdog.onExpectedRestart({ expiresAt: Date.now() + 60_000 });
+      const launchedAt = Date.now() + 1_000;
+      h.watchdog.onGatewayLaunch({ startedAt: launchedAt, pid: 500, rootPid: 500, generation: 7 });
+      h.control.healthy = true;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(hook).toHaveBeenCalledTimes(1);
+      expect(hook).toHaveBeenCalledWith({ operationId: "op-1", code: "stop_failed", by: "watchdog_repair", launchedAt, at: expect.any(Number) });
+      await h.watchdog.runHealthCheck({ source: "health_timer" });
+      expect(hook).toHaveBeenCalledTimes(1);
+      h.watchdog.stop();
+
+      const hook2 = vi.fn(() => { throw new Error("boom"); });
+      const h2 = createHarness({ onRestartFailureRecovered: hook2 });
+      await h2.failUserRestart();
+      h2.watchdog.noteRestartFailure({ operationId: "op-2", code: "ready_timeout", gatewayDown: false });
+      h2.control.healthy = true;
+      await h2.watchdog.runHealthCheck({ source: "health_timer" });
+      await flushMicrotasks();
+      expect(hook2).toHaveBeenCalledWith(expect.objectContaining({ operationId: "op-2", code: "ready_timeout", by: "restart_child" }));
+      expect(h2.watchdog.getStatus()).toMatchObject({ health: "healthy", restartFailureNote: null });
+      expect(h2.rowsOf("restart", "ok", "restart_failure_note")[0].details.recoveredBy).toBe("restart_child");
+      h2.watchdog.stop();
+
+      const hook3 = vi.fn();
+      const h3 = createHarness({ onRestartFailureRecovered: hook3 });
+      await h3.failUserRestart();
+      h3.watchdog.noteRestartFailure({ operationId: "op-3", code: "launch_failed", gatewayDown: false });
+      h3.control.healthy = true;
+      await h3.watchdog.runHealthCheck({ source: "health_timer" });
+      await flushMicrotasks();
+      expect(hook3).toHaveBeenCalledWith(expect.objectContaining({ operationId: "op-3", by: "unknown" }));
+      h3.watchdog.stop();
+    });
+
     it("expires after 15 minutes: the note reads null, and a note filed again is a fresh one", async () => {
       vi.useFakeTimers();
       const h = createHarness();
@@ -628,6 +716,226 @@ describe("watchdog failed-restart handoff (bug #137)", () => {
       expect(
         h.watchdog.noteRestartFailure({ operationId: "op-2", code: "something_else", gatewayDown: false }).note.code,
       ).toBe("restart_failed");
+    });
+  });
+
+  // PR 2 — cause linkage. Incident #2213 on the #137 box read "none recorded"
+  // although the outage WAS the failed restart op: while the note stands,
+  // the rows that open a degraded/readiness incident carry the restart as a
+  // SUSPECTED cause, and filing a note while one is already open stamps it
+  // through one `restart / restart_failed / failed` row.
+  describe("incident cause linkage while the note stands (PR 2)", () => {
+    const openCause = (h) => h.db.getOpenIncident()?.cause ?? null;
+    const restartCause = (code, operationId) => ({
+      cause: code,
+      fingerprint: null,
+      corroborated: false,
+      by: `restart:${operationId}`,
+      suspectedCause: null,
+      at: expect.any(String),
+    });
+    const greenGateway = async (h) => {
+      h.watchdog.onGatewayLaunch({ startedAt: Date.now() - 60_000, pid: 100 });
+      await flushMicrotasks();
+      expect(h.watchdog.getStatus().health).toBe("healthy");
+      expect(h.db.getOpenIncident()).toBeNull();
+    };
+
+    it("(a) note filed with nothing open: the failed health_check that opens the incident carries restart_stop_failed / by restart:<op> / corroborated false", async () => {
+      const h = createHarness({ autoRepair: false, trackIncidents: true });
+      await greenGateway(h);
+      h.watchdog.noteRestartFailure({ operationId: "op-a", code: "stop_failed", gatewayDown: true });
+      // The note's own row is history, not an incident: nothing is open.
+      expect(h.rowsOf("restart", "failed", "restart_failed")).toEqual([
+        expect.objectContaining({
+          details: {
+            operationId: "op-a",
+            code: "stop_failed",
+            phase: null,
+            signalled: false,
+            gatewayDown: true,
+            cause: "restart_stop_failed",
+            by: "restart:op-a",
+            corroborated: false,
+          },
+        }),
+      ]);
+      expect(h.db.getOpenIncident()).toBeNull();
+
+      h.control.healthy = false;
+      await h.watchdog.runHealthCheck({ source: "health_timer" });
+      await flushMicrotasks();
+      const opened = h.db.getOpenIncident();
+      expect(opened).toMatchObject({ incidentKey: "gateway_degraded" });
+      expect(opened.cause).toEqual(restartCause("restart_stop_failed", "op-a"));
+      const [failedRow] = h.rowsOf("health_check", "failed");
+      expect(failedRow.details).toMatchObject({
+        reason: expect.any(String),
+        cause: "restart_stop_failed",
+        by: "restart:op-a",
+        corroborated: false,
+      });
+      expect(h.db.getIncidentEvents(opened.id).events.map((e) => e.eventType)).toContain("health_check");
+    });
+
+    it("(b) incident already open when the note is filed: the restart/restart_failed/failed row sets its cause", async () => {
+      vi.useFakeTimers();
+      const h = createHarness({ trackIncidents: true });
+      // The box's shape: operation_end's probe already opened the incident
+      // with no cause before the route filed the note.
+      await h.failUserRestart();
+      const opened = h.db.getOpenIncident();
+      expect(opened).toMatchObject({ incidentKey: "gateway_degraded", cause: null });
+
+      h.watchdog.noteRestartFailure({
+        operationId: "9e1e29ab-0000-4000-8000-000000000000",
+        code: "stop_failed",
+        phase: "sigkill",
+        signalled: true,
+        gatewayDown: true,
+      });
+      expect(h.db.getOpenIncident().id).toBe(opened.id);
+      expect(openCause(h)).toEqual(
+        restartCause("restart_stop_failed", "9e1e29ab-0000-4000-8000-000000000000"),
+      );
+      const [noteRow] = h.db
+        .getIncidentEvents(opened.id)
+        .events.filter((e) => e.eventType === "restart" && e.source === "restart_failed");
+      expect(noteRow).toMatchObject({
+        status: "failed",
+        details: {
+          operationId: "9e1e29ab-0000-4000-8000-000000000000",
+          code: "stop_failed",
+          phase: "sigkill",
+          signalled: true,
+          gatewayDown: true,
+          cause: "restart_stop_failed",
+          by: "restart:9e1e29ab-0000-4000-8000-000000000000",
+          corroborated: false,
+        },
+      });
+      // The same operation reported twice files no second row.
+      h.watchdog.noteRestartFailure({ operationId: "9e1e29ab-0000-4000-8000-000000000000", code: "stop_failed", gatewayDown: true });
+      expect(h.rowsOf("restart", "failed", "restart_failed")).toHaveLength(1);
+      h.watchdog.stop();
+    });
+
+    it("(c) a corroborated crash cause set earlier survives the note row and the later failed probes", async () => {
+      const h = createHarness({ autoRepair: false, trackIncidents: true });
+      await greenGateway(h);
+      h.control.healthy = false;
+      await h.watchdog.runHealthCheck({ source: "health_timer" });
+      const opened = h.db.getOpenIncident();
+      expect(opened).toMatchObject({ cause: null });
+      // The crash classifier's corroborated verdict lands on the open incident.
+      h.insertWatchdogEvent({
+        eventType: "crash_cause",
+        source: "crash_classifier",
+        status: "failed",
+        details: {
+          cause: "state_schema_too_new",
+          fingerprint: "0123456789ab",
+          corroborated: true,
+          by: "user_version",
+          suspectedCause: null,
+        },
+        correlationId: "cc-1",
+      });
+      expect(openCause(h)).toMatchObject({ cause: "state_schema_too_new", corroborated: true });
+
+      h.watchdog.noteRestartFailure({ operationId: "op-c", code: "launch_failed", gatewayDown: true });
+      expect(h.rowsOf("restart", "failed", "restart_failed").at(-1).details).toMatchObject({
+        cause: "restart_launch_failed",
+        by: "restart:op-c",
+      });
+      await h.watchdog.runHealthCheck({ source: "health_timer" });
+      expect(h.rowsOf("health_check", "failed").at(-1).details).toMatchObject({ cause: "restart_launch_failed" });
+      expect(h.db.getOpenIncident().id).toBe(opened.id);
+      expect(openCause(h)).toMatchObject({
+        cause: "state_schema_too_new",
+        corroborated: true,
+        by: "user_version",
+      });
+    });
+
+    it("(d) after the green probe clears the note, a NEW incident carries no restart cause", async () => {
+      const h = createHarness({ autoRepair: false, trackIncidents: true });
+      await greenGateway(h);
+      h.watchdog.noteRestartFailure({ operationId: "op-d", code: "stop_failed", gatewayDown: true });
+      h.control.healthy = false;
+      await h.watchdog.runHealthCheck({ source: "health_timer" });
+      const first = h.db.getOpenIncident();
+      expect(first.cause).toMatchObject({ cause: "restart_stop_failed", by: "restart:op-d" });
+
+      h.control.healthy = true;
+      await h.watchdog.runHealthCheck({ source: "health_timer" });
+      await flushMicrotasks();
+      expect(h.watchdog.getRestartFailureNote()).toBeNull();
+      expect(h.rowsOf("restart", "ok", "restart_failure_note")).toHaveLength(1);
+      expect(h.db.getOpenIncident()).toBeNull();
+      expect(h.db.getIncidentById(first.id)).toMatchObject({ status: "resolved" });
+      expect(h.db.getIncidentById(first.id).cause).toMatchObject({ cause: "restart_stop_failed" });
+
+      h.control.healthy = false;
+      await h.watchdog.runHealthCheck({ source: "health_timer" });
+      const second = h.db.getOpenIncident();
+      expect(second.id).not.toBe(first.id);
+      expect(second.cause).toBeNull();
+      const lastFailed = h.rowsOf("health_check", "failed").at(-1).details;
+      expect(lastFailed).not.toHaveProperty("cause");
+      expect(lastFailed).not.toHaveProperty("by");
+    });
+
+    it("(e) the code → cause map: ready_timeout → restart_ready_timeout (on the readiness row too), aborted, launch_failed, and the restart_failed fallback", async () => {
+      const h = createHarness({ autoRepair: false, trackIncidents: true });
+      await greenGateway(h);
+      // ready_timeout: the port answers /health but /readyz never came ready
+      // — the readiness_degraded row opens the incident with the cause.
+      h.watchdog.noteRestartFailure({ operationId: "op-rt", code: "ready_timeout", gatewayDown: false });
+      h.control.readyzFailing = ["secrets"];
+      await h.watchdog.runHealthCheck({ source: "health_timer" });
+      await flushMicrotasks();
+      const opened = h.db.getOpenIncident();
+      expect(opened).toMatchObject({ incidentKey: "gateway_readiness" });
+      expect(opened.cause).toEqual(restartCause("restart_ready_timeout", "op-rt"));
+      expect(h.rowsOf("readiness_degraded", "failed").at(-1).details).toMatchObject({
+        failing: ["secrets"],
+        cause: "restart_ready_timeout",
+        by: "restart:op-rt",
+        corroborated: false,
+      });
+      // Each later note replaces the previous (different operationId) and
+      // names its own code; an unknown code collapses to restart_failed.
+      const causesByCode = [
+        ["aborted", "restart_aborted"],
+        ["launch_failed", "restart_launch_failed"],
+        ["stop_failed", "restart_stop_failed"],
+        ["something_else", "restart_failed"],
+      ];
+      for (const [code, cause] of causesByCode) {
+        h.watchdog.noteRestartFailure({ operationId: `op-${code}`, code, gatewayDown: false });
+        expect(h.rowsOf("restart", "failed", "restart_failed").at(-1).details).toMatchObject({
+          cause,
+          by: `restart:op-${code}`,
+          corroborated: false,
+        });
+        // Suspected tier: within it the latest wins.
+        expect(openCause(h)).toMatchObject({ cause, by: `restart:op-${code}` });
+      }
+    });
+
+    it("a note without an operationId still names the cause, with no `by`", async () => {
+      const h = createHarness({ autoRepair: false, trackIncidents: true });
+      await greenGateway(h);
+      h.watchdog.noteRestartFailure({ code: "stop_failed", gatewayDown: true });
+      expect(h.rowsOf("restart", "failed", "restart_failed").at(-1).details).toMatchObject({
+        operationId: null,
+        cause: "restart_stop_failed",
+        by: null,
+      });
+      h.control.healthy = false;
+      await h.watchdog.runHealthCheck({ source: "health_timer" });
+      expect(openCause(h)).toMatchObject({ cause: "restart_stop_failed", by: null, corroborated: false });
     });
   });
 });
