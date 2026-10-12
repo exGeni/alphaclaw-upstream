@@ -48,7 +48,9 @@ jobs:
       # PR bumps, including reverts. See CLAUDE.md "Merge unification safety".
       - name: Version guard
         # Once per PR is enough — the guard is not Node-version dependent.
-        if: github.event_name == 'pull_request' && matrix.node-version == 24
+        # exgenius fork: -exgenius.N is a semver pre-release of the upstream base version,
+        # so it can never 'advance' an exgenius-*/base branch; the guard is for main only.
+        if: github.event_name == 'pull_request' && matrix.node-version == 24 && !startsWith(github.base_ref, 'exgenius-')
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
