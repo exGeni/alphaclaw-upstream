@@ -4,7 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # exgenius fork: also run on PRs into exgenius-*/base release-line branches
+    branches: [main, 'exgenius-*/base']
 
 # Read-only token (fix wave F177): the job runs third-party code (npm
 # lifecycle scripts, the UI build, the test suite) with GITHUB_TOKEN in the
