@@ -410,7 +410,19 @@ describeContainer("container E2E: boot durability — fresh and restarted contai
       intervalMs: 3000,
       label: `gateway /healthz inside ${kContainerB} after the seeded boot`,
     });
-    expect(leaseWaits.length).toBeGreaterThan(0);
+    // 2026.10.2 decides A's gateway-owner lease from its heartbeat: once the
+    // heartbeat is stale (90 s) B's gateway takes it over silently; while it
+    // is fresh, B's gateway refuses with GatewayLockNamespaceError ("cannot
+    // verify Gateway ownership from this process (different PID namespace)")
+    // and the watchdog must hold an owner_lease_held wait instead of counting
+    // crashes. Which one a run sees depends on runner speed, so assert the
+    // pairing: a refusal in B's log implies the bounded wait was observed.
+    // The refusal text only reaches stderr because AlphaClaw launches the
+    // gateway with OPENCLAW_DEBUG=1 (2026.10 hides the Reason line otherwise).
+    const refusedForFreshLease = /GatewayLockNamespaceError|cannot verify Gateway ownership from this process/.test(
+      await containerLogs(kContainerB, { tail: 5000 }),
+    );
+    if (refusedForFreshLease) expect(leaseWaits.length).toBeGreaterThan(0);
     for (const wait of leaseWaits) {
       expect(wait.state).toBe("starting");
       expect(wait.retry).not.toBeNull();
