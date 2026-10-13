@@ -1237,6 +1237,17 @@ describe("server/agents/service coverage", () => {
   });
 
   describe("channels domain: login", () => {
+    // The login-window knob is read per call from process.env; keep every test
+    // in this block independent of the runner's environment.
+    let previousLoginWindow;
+    beforeEach(() => {
+      previousLoginWindow = process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS;
+      delete process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS;
+    });
+    afterEach(() => {
+      if (previousLoginWindow === undefined) delete process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS;
+      else process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS = previousLoginWindow;
+    });
     it("defaults to the default account for login and login status", async () => {
       const clawCmd = vi.fn(async () => ({
         ok: true,

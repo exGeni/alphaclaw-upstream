@@ -3553,6 +3553,37 @@ describe("server/gateway restart behavior", () => {
         },
       );
 
+      it.each(["remove", "all"])(
+        "leaves the production native shape (no enabled key, peer bindings) byte-identical, mode=%s",
+        async (mode) => {
+          const initial = JSON.stringify({
+            channels: {
+              whatsapp: {
+                dmPolicy: "allowlist",
+                allowFrom: ["+15550100", "+15550101"],
+                selfChatMode: false,
+                groupPolicy: "disabled",
+              },
+            },
+            bindings: [
+              {
+                agentId: "a",
+                match: { channel: "whatsapp", peer: { kind: "direct", id: "+15550100" } },
+              },
+            ],
+          });
+          const state = setupConfig(initial);
+          childProcess.execFile = execFileOk("");
+          delete require.cache[modulePath];
+          const gateway = require(modulePath);
+
+          await gateway.syncChannelConfig([], mode);
+
+          expect(childProcess.execFile).not.toHaveBeenCalled();
+          expect(state.raw).toBe(initial);
+        },
+      );
+
       it("does not touch a native whatsapp config while other managed channels still sync", async () => {
         setupConfig(
           JSON.stringify({
