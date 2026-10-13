@@ -1043,6 +1043,54 @@ describe("server/agents/service coverage", () => {
     });
   });
 
+  describe("channels domain: update (whatsapp root schema)", () => {
+    const nativeWhatsApp = () => ({
+      dmPolicy: "allowlist",
+      allowFrom: ["+15550100"],
+      selfChatMode: false,
+      groupPolicy: "disabled",
+    });
+
+    it("does not write a root-level name on a flat whatsapp config", () => {
+      const { fsMock, service } = buildService({
+        initialConfig: { channels: { whatsapp: nativeWhatsApp() } },
+      });
+
+      const result = service.updateChannelAccount({
+        provider: "whatsapp",
+        name: "Renamed",
+        agentId: "main",
+      });
+
+      expect(result.account.id).toBe("default");
+      const config = fsMock.readConfig();
+      // The strict WhatsApp plugin schema rejects `name` at the channel root.
+      expect(config.channels.whatsapp).not.toHaveProperty("name");
+      expect(config.channels.whatsapp).toEqual(nativeWhatsApp());
+    });
+
+    it("still writes the name under a named whatsapp account", () => {
+      const { fsMock, service } = buildService({
+        initialConfig: {
+          channels: {
+            whatsapp: { accounts: { work: { allowFrom: ["+15550100"] } } },
+          },
+        },
+      });
+
+      service.updateChannelAccount({
+        provider: "whatsapp",
+        accountId: "work",
+        name: "Work line",
+        agentId: "main",
+      });
+
+      const config = fsMock.readConfig();
+      expect(config.channels.whatsapp).not.toHaveProperty("name");
+      expect(config.channels.whatsapp.accounts.work.name).toBe("Work line");
+    });
+  });
+
   describe("channels domain: delete", () => {
     it("throws for unknown providers and accounts on delete", async () => {
       const empty = buildService();
@@ -1313,6 +1361,38 @@ describe("server/agents/service coverage", () => {
         accountId: "default",
         linked: false,
       });
+    });
+
+    it("uses ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS for the QR login window", async () => {
+      const previous = process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS;
+      process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS = "45000";
+      try {
+        const clawCmd = vi.fn(async () => ({ ok: true, stdout: "", stderr: "", code: 0 }));
+        const { service } = buildService({ clawCmd });
+
+        await service.runChannelAccountLogin({ provider: "whatsapp" });
+
+        expect(clawCmd.mock.calls[0][1]).toMatchObject({ timeoutMs: 45000, killScope: "leader" });
+      } finally {
+        if (previous === undefined) delete process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS;
+        else process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS = previous;
+      }
+    });
+
+    it("falls back to the 12 s login window for a junk value", async () => {
+      const previous = process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS;
+      process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS = "not-a-number";
+      try {
+        const clawCmd = vi.fn(async () => ({ ok: true, stdout: "", stderr: "", code: 0 }));
+        const { service } = buildService({ clawCmd });
+
+        await service.runChannelAccountLogin({ provider: "whatsapp" });
+
+        expect(clawCmd.mock.calls[0][1].timeoutMs).toBe(12000);
+      } finally {
+        if (previous === undefined) delete process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS;
+        else process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS = previous;
+      }
     });
 
     it("rejects login status for non-whatsapp providers", () => {
