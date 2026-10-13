@@ -28,8 +28,8 @@ filing is a separate step.
   `channels remove --channel whatsapp --delete` whenever
   `channels.whatsapp.enabled` was truthy and `WHATSAPP_OWNER_NUMBER` was
   absent, i.e. for any WhatsApp channel configured outside AlphaClaw (literal
-  `allowFrom`, peer bindings). The removal branch now honors the
-  `sync: false` declared for WhatsApp: it runs only when the channel config
+  `allowFrom`, peer bindings). The removal branch now guards
+  `sync: false` channels (WhatsApp): it runs only when the channel config
   references the env key (`${WHATSAPP_OWNER_NUMBER}` or a per-account
   `${WHATSAPP_OWNER_NUMBER_<SUFFIX>}`), i.e. config AlphaClaw derived from the
   env var. The add branch and the removal of such env-derived config are
@@ -44,7 +44,8 @@ filing is a separate step.
   under `accounts.<id>`), leaving an invalid config. The root write is skipped
   for WhatsApp; named accounts still get `accounts.<id>.name`; Telegram,
   Discord and Slack are unchanged. (The update still re-binds the account to
-  the selected agent, as before.)
+  the selected agent, as before, and still echoes the requested name in its
+  response; for a flat WhatsApp config that name is not persisted.)
 
 ### Added
 
@@ -57,7 +58,8 @@ filing is a separate step.
 
 - `tests/bin/admin-cli.test.js`: DELETE body + `Content-Length` (incl. multibyte),
   POST intact, no `Content-Length` without a body.
-- `tests/server/gateway.test.js`: native WhatsApp config is never removed
+- `tests/server/gateway.test.js`: native WhatsApp config (with and without
+  `enabled`, with peer bindings) and the fresh-onboarding shape are never removed
   (modes `remove` and `all`), env-referencing config (base and per-account
   suffix) is still removed, other channels keep their behavior.
 - `tests/server/agents-service-coverage.test.js`: no root `name` on a flat

@@ -3584,6 +3584,36 @@ describe("server/gateway restart behavior", () => {
         },
       );
 
+      it.each(["remove", "all"])(
+        "does not remove the fresh-onboarding whatsapp shape (owner number stored literally), mode=%s",
+        async (mode) => {
+          // onboarding/openclaw.js writes the owner number literally, not as an env
+          // reference. Intentional behavior change: clearing the key no longer
+          // deletes it (and its linked session) automatically.
+          const initial = JSON.stringify({
+            channels: {
+              whatsapp: {
+                enabled: true,
+                allowFrom: ["+15550100"],
+                groupAllowFrom: ["+15550100"],
+                dmPolicy: "allowlist",
+                groupPolicy: "allowlist",
+                selfChatMode: true,
+              },
+            },
+          });
+          const state = setupConfig(initial);
+          childProcess.execFile = execFileOk("");
+          delete require.cache[modulePath];
+          const gateway = require(modulePath);
+
+          await gateway.syncChannelConfig([], mode);
+
+          expect(childProcess.execFile).not.toHaveBeenCalled();
+          expect(state.raw).toBe(initial);
+        },
+      );
+
       it("does not touch a native whatsapp config while other managed channels still sync", async () => {
         setupConfig(
           JSON.stringify({
