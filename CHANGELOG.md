@@ -5,6 +5,64 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.2-exgenius.2] - 2026-10-13
+
+exGeni fork patch on top of **0.10.2-exgenius.1**: AlphaClaw stops breaking an
+OpenClaw-native WhatsApp setup (one number, many senders, peer bindings) and
+its admin CLI works for `DELETE`. OpenClaw stays pinned to **2026.9.8**. All
+three defects are present, unchanged, in upstream `garrytan/alphaclaw` main
+(b54801e, v0.10.4); none of them comes from a fork-only commit. Upstream
+filing is a separate step.
+
+### Fixed
+
+- **`alphaclaw admin DELETE … --data` delivers its body:** `cli/admin.js` wrote
+  the body but set no `Content-Length`; Node's `ClientRequest` does not
+  chunk-encode DELETE (nor GET/HEAD/OPTIONS), so the server read an empty
+  body and every body-located DELETE (`agents.binding-remove`, `channels.account-remove`)
+  failed with a missing-field error. A body is now always framed with its byte
+  length. POST/PUT/PATCH are unchanged (they were already chunked); a request
+  without a body still sends no `Content-Length`.
+- **Env-sync no longer deletes an OpenClaw-native WhatsApp config:**
+  `syncChannelConfig` (AlphaClaw boot, every Envars save) ran
+  `channels remove --channel whatsapp --delete` whenever
+  `channels.whatsapp.enabled` was truthy and `WHATSAPP_OWNER_NUMBER` was
+  absent, i.e. for any WhatsApp channel configured outside AlphaClaw (literal
+  `allowFrom`, peer bindings). The removal branch now honors the
+  `sync: false` declared for WhatsApp: it runs only when the channel config
+  references the env key (`${WHATSAPP_OWNER_NUMBER}` or a per-account
+  `${WHATSAPP_OWNER_NUMBER_<SUFFIX>}`), i.e. config AlphaClaw derived from the
+  env var. The add branch and the removal of such env-derived config are
+  unchanged. **Behavior change:** the fresh-onboarding WhatsApp config
+  (`onboarding/openclaw.js`) stores the owner number literally, so clearing
+  `WHATSAPP_OWNER_NUMBER` no longer removes it; the 0.10.2-exgenius.1 test that
+  pinned the old behavior (`{ whatsapp: { enabled: true } }` is removed) is
+  replaced by tests for the native and the env-referencing cases.
+- **`channels.account-update` no longer writes `channels.whatsapp.name`:** on a
+  flat (legacy default) WhatsApp config the rename wrote `name` at the channel
+  root, which the strict WhatsApp plugin schema rejects (`name` is valid only
+  under `accounts.<id>`), leaving an invalid config. The root write is skipped
+  for WhatsApp; named accounts still get `accounts.<id>.name`; Telegram,
+  Discord and Slack are unchanged. (The update still re-binds the account to
+  the selected agent, as before.)
+
+### Added
+
+- **`ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS`** (default `12000`, read per call, same
+  parsing as `ALPHACLAW_CHANNEL_CMD_TIMEOUT_MS`): how long the WhatsApp QR login
+  op waits for the login CLI to print the QR. The CLI itself still outlives the
+  call (leader-only kill). Default behavior is unchanged.
+
+### Tests
+
+- `tests/bin/admin-cli.test.js`: DELETE body + `Content-Length` (incl. multibyte),
+  POST intact, no `Content-Length` without a body.
+- `tests/server/gateway.test.js`: native WhatsApp config is never removed
+  (modes `remove` and `all`), env-referencing config (base and per-account
+  suffix) is still removed, other channels keep their behavior.
+- `tests/server/agents-service-coverage.test.js`: no root `name` on a flat
+  WhatsApp config, `accounts.<id>.name` still written, login window knob.
+
 ## [0.10.2-exgenius.1] - 2026-10-12
 
 exGeni fork line rebuilt on upstream **v0.10.2** (`garrytan/alphaclaw` main
