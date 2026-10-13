@@ -264,6 +264,67 @@ describe("cli/admin runAdminCommand", () => {
     expect(stub.received).toHaveLength(1);
   });
 
+  describe("request body framing", () => {
+    it("delivers the --data body on DELETE (Content-Length is set)", async () => {
+      writeToken(rootDir);
+      const stub = await useStub(jsonHandler(200, { ok: true }));
+      const bodyJson = JSON.stringify({ channel: "whatsapp", peer: { kind: "direct", id: "+15550100" } });
+
+      const code = await runAdminCommand({
+        argv: ["DELETE", "/api/agents/ag/bindings", "--data", bodyJson],
+        rootDir,
+      });
+
+      expect(code).toBe(0);
+      expect(stub.received).toHaveLength(1);
+      expect(stub.received[0].method).toBe("DELETE");
+      expect(stub.received[0].body).toBe(bodyJson);
+      expect(stub.received[0].headers["content-length"]).toBe(
+        String(Buffer.byteLength(bodyJson)),
+      );
+    });
+
+    it("frames a multibyte body by bytes, not characters", async () => {
+      writeToken(rootDir);
+      const stub = await useStub(jsonHandler(200, { ok: true }));
+      const bodyJson = JSON.stringify({ name: "Привет — ✓" });
+      expect(Buffer.byteLength(bodyJson)).toBeGreaterThan(bodyJson.length);
+
+      await runAdminCommand({
+        argv: ["DELETE", "/api/channels/accounts", "--data", bodyJson],
+        rootDir,
+      });
+
+      expect(stub.received[0].body).toBe(bodyJson);
+      expect(stub.received[0].headers["content-length"]).toBe(
+        String(Buffer.byteLength(bodyJson)),
+      );
+    });
+
+    it("keeps POST bodies intact", async () => {
+      writeToken(rootDir);
+      const stub = await useStub(jsonHandler(200, { ok: true }));
+      const bodyJson = JSON.stringify({ a: 1 });
+
+      await runAdminCommand({
+        argv: ["POST", "/api/x", "--data", bodyJson],
+        rootDir,
+      });
+
+      expect(stub.received[0].body).toBe(bodyJson);
+    });
+
+    it("sends no Content-Length on a GET without a body", async () => {
+      writeToken(rootDir);
+      const stub = await useStub(jsonHandler(200, { ok: true }));
+
+      await runAdminCommand({ argv: ["GET", "/api/status"], rootDir });
+
+      expect(stub.received[0].body).toBe("");
+      expect(stub.received[0].headers).not.toHaveProperty("content-length");
+    });
+  });
+
   it("never leaks a __port pseudo-header to the server", async () => {
     writeToken(rootDir);
     const stub = await useStub(jsonHandler(200, { ok: true }));
