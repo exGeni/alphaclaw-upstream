@@ -214,6 +214,19 @@ notes; their texts are kept below.
 | 76f5b7f | tests for the two WhatsApp fixes | none | clean |
 | 2cec834, a2fa8c6 | ci(exgenius): unit suite on PRs into `exgenius-*/base`; version guard skipped there | fork CI only | clean |
 
+### Fixed (Codex review of PR #6)
+
+- **Topic routes refuse a non-slug `agentId`** (create, bulk create,
+  update): the id must pass `isValidAgentId` exactly as sent, so `" MAIN "`,
+  `"MAIN"` or `"foo!!!bar"` no longer canonicalize onto a configured agent
+  and persist the raw value; the rejection writes the `[input] rejected …
+  field=agentId reason=invalid_shape` audit line. An empty id still unroutes.
+- **Bulk create and update recheck the agent after the Telegram await**, as
+  the single create already did: an agent deleted meanwhile is not written
+  back into the registry. A bulk row then reports the topic as created
+  unrouted (`ok: false`); an update keeps the topic's old routing, applies
+  the rename and answers 409.
+
 ### Dropped
 
 - **a82b4bb "keep explicit agent ownership free of default markers" (#126,
