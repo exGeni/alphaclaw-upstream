@@ -473,24 +473,86 @@ describe("server/routes/telegram", () => {
       expect(telegramApi.editForumTopic).not.toHaveBeenCalled();
       expect(readRegistryFile().groups["-100"].topics["5"]).toEqual({ name: "Ops" });
 
-      // OpenClaw canonicalizes agent ids (trim + lowercase), so " MAIN " names main.
-      const canonical = await request(app)
-        .put("/api/telegram/groups/-100/topics/5")
-        .send({ name: "Ops", agentId: " MAIN " });
-      expect(canonical.body.ok).toBe(true);
+      // The id must be a slug as sent (isValidAgentId): " MAIN " would
+      // canonicalize onto main but persist the raw value, so it is refused (codex).
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      for (const raw of [" MAIN ", "MAIN", "foo!!!bar", 7]) {
+        const shaped = await request(app)
+          .put("/api/telegram/groups/-100/topics/5")
+          .send({ name: "Ops", agentId: raw });
+        expect(shaped.status).toBe(400);
+        expect(shaped.body.error).toContain("Invalid agent id");
+      }
+      const shapedBulk = await request(app)
+        .post("/api/telegram/groups/-100/topics/bulk")
+        .send({ topics: [{ name: "A", agentId: " main" }] });
+      expect(shapedBulk.status).toBe(400);
+      const shapedCreate = await request(app)
+        .post("/api/telegram/groups/-100/topics")
+        .send({ name: "New", agentId: "Main" });
+      expect(shapedCreate.status).toBe(400);
+      expect(warn.mock.calls.some(([line]) => /\[input\] rejected .*field=agentId reason=invalid_shape/.test(line))).toBe(true);
+      expect(telegramApi.createForumTopic).not.toHaveBeenCalled();
+      expect(telegramApi.editForumTopic).not.toHaveBeenCalled();
+      expect(readRegistryFile().groups["-100"].topics["5"]).toEqual({ name: "Ops" });
 
       // A known agent and an empty id (unroute) are accepted.
       const ok = await request(app)
         .put("/api/telegram/groups/-100/topics/5")
         .send({ name: "Ops", agentId: "main" });
       expect(ok.body.ok).toBe(true);
-      expect(ok.body.topicChanges).toEqual({ removed: [], added: [], changed: ["5"] });
+      // The refused " MAIN " wrote nothing, so this is the first routed write.
+      expect(ok.body.topicChanges).toEqual({ removed: [], added: ["5"], changed: [] });
       const unroute = await request(app)
         .put("/api/telegram/groups/-100/topics/5")
         .send({ name: "Ops", agentId: "" });
       expect(unroute.body.ok).toBe(true);
       expect(unroute.body.topicChanges).toEqual({ removed: ["5"], added: [], changed: [] });
     });
+  });
+
+  it("bulk create rechecks each topic's agent after the Telegram await (codex)", async () => {
+    writeOpenclawJson({ agents: { list: [{ id: "main" }, { id: "scout" }] } });
+    writeRegistryFile({ version: 2, meta: { sweepWatermark: 0 }, groups: { "-100": { name: "G", topics: {} } } });
+    let nextThread = 10;
+    const telegramApi = makeTelegramApi({
+      createForumTopic: vi.fn(async (chatId, name) => {
+        // scout is deleted while the first Telegram call is pending.
+        writeOpenclawJson({ agents: { list: [{ id: "main" }] } });
+        return { message_thread_id: nextThread++, name, icon_color: 1 };
+      }),
+    });
+    const { app } = createApp({ telegramApi });
+    const res = await request(app)
+      .post("/api/telegram/groups/-100/topics/bulk")
+      .send({ topics: [{ name: "A", agentId: "scout" }, { name: "B", agentId: "main" }] });
+    expect(res.body.ok).toBe(true);
+    expect(res.body.results[0]).toMatchObject({ threadId: 10, ok: false });
+    expect(res.body.results[0].error).toContain("created unrouted");
+    expect(res.body.results[1]).toMatchObject({ threadId: 11, ok: true });
+    const topics = readRegistryFile().groups["-100"].topics;
+    expect(topics["10"].agentId).toBeUndefined();
+    expect(topics["11"].agentId).toBe("main");
+  });
+
+  it("update rechecks the agent after the Telegram rename and keeps the old routing (codex)", async () => {
+    writeOpenclawJson({ agents: { list: [{ id: "main" }, { id: "scout" }] } });
+    writeRegistryFile({ version: 2, meta: { sweepWatermark: 0 }, groups: { "-100": { name: "G", topics: { 5: { name: "Ops", agentId: "main" } } } } });
+    const telegramApi = makeTelegramApi({
+      editForumTopic: vi.fn(async () => {
+        writeOpenclawJson({ agents: { list: [{ id: "main" }] } });
+        return {};
+      }),
+    });
+    const { app } = createApp({ telegramApi });
+    const res = await request(app)
+      .put("/api/telegram/groups/-100/topics/5")
+      .send({ name: "Renamed", agentId: "scout" });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("routing was not changed");
+    const topic = readRegistryFile().groups["-100"].topics["5"];
+    expect(topic.name).toBe("Renamed");
+    expect(topic.agentId).toBe("main");
   });
 
   it("an unparseable openclaw.json makes a topic agentId check fail closed (503), not a 400 (codex)", async () => {
