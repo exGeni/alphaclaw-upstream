@@ -962,6 +962,10 @@ notes; their texts are kept below.
   back into the registry. A bulk row then reports the topic as created
   unrouted (`ok: false`); an update keeps the topic's old routing, applies
   the rename and answers 409.
+- **`alphaclaw telegram topic add|create --agent` follow the same rules**: a
+  non-slug value is refused before any write, and `topic create` rechecks the
+  agent after the Telegram call, registering the topic unrouted (exit 1) when
+  the agent was deleted meanwhile.
 
 ### Dropped
 
