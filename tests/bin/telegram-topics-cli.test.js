@@ -14,6 +14,13 @@ if (testHome) {
 }
 if (process.env.ALPHACLAW_TEST_FETCH_MODE) {
   globalThis.fetch = async (url, options = {}) => {
+    // Simulates a concurrent config change while the Telegram call is pending.
+    if (process.env.ALPHACLAW_TEST_FETCH_WRITE_PATH) {
+      fs.writeFileSync(
+        process.env.ALPHACLAW_TEST_FETCH_WRITE_PATH,
+        process.env.ALPHACLAW_TEST_FETCH_WRITE_CONTENT || "",
+      );
+    }
     const capturePath = process.env.ALPHACLAW_TEST_FETCH_CAPTURE;
     if (capturePath) {
       fs.writeFileSync(
@@ -171,8 +178,42 @@ describe("bin/alphaclaw telegram topic commands", () => {
       expect(cfg.channels.telegram.accounts).toBeUndefined();
     });
 
+    it("refuses an unknown --agent and prints the topic keys a sync drops (0.9.95-exgenius.7)", () => {
+      writeConfig({
+        agents: { list: [{ id: "main" }] },
+        channels: {
+          telegram: {
+            enabled: true,
+            groups: { "-100123": { topics: { "39": { agentId: "main", systemPrompt: "config only" } } } },
+          },
+        },
+      });
+      const refused = runCli([
+        "telegram", "topic", "add", "--thread", "12", "--name", "Ops", "--agent", "ghost",
+      ]);
+      expect(refused.status).toBe(1);
+      expect(refused.stderr).toContain('Unknown agent "ghost"');
+      expect(fs.existsSync(registryPath())).toBe(false);
+
+      const mapped = runCli(["telegram", "topic", "add", "--thread", "12", "--name", "Ops", "--agent", "main"]);
+      expect(mapped.status).toBe(0);
+      expect(mapped.stdout).toContain("Topic config changes: removed=39 added=12");
+    });
+
+    it("refuses a non-slug --agent even when it canonicalizes to a configured agent (codex)", () => {
+      writeConfig({ ...kTopLevelConfig, agents: { list: [{ id: "main" }, { id: "foo-bar" }] } });
+      for (const raw of ["MAIN", " main", "foo!!!bar"]) {
+        const refused = runCli([
+          "telegram", "topic", "add", "--thread", "12", "--name", "Ops", "--agent", raw,
+        ]);
+        expect(refused.status).toBe(1);
+        expect(refused.stderr).toContain("Invalid agent id");
+      }
+      expect(fs.existsSync(registryPath())).toBe(false);
+    });
+
     it("resolves accounts.*.groups and passes the accountId through to config sync", () => {
-      writeConfig(kAccountsConfig);
+      writeConfig({ ...kAccountsConfig, agents: { list: [{ id: "main" }, { id: "qa" }] } });
       const result = runCli([
         "telegram", "topic", "add", "--thread", "9", "--name", "QA", "--agent", "qa",
       ]);
@@ -294,8 +335,36 @@ describe("bin/alphaclaw telegram topic commands", () => {
     const readFetchCapture = () =>
       JSON.parse(fs.readFileSync(fetchCapturePath(), "utf8"));
 
+    it("registers the topic unrouted when --agent is deleted during the Telegram call (codex)", () => {
+      writeConfig({ ...kTopLevelConfig, agents: { list: [{ id: "main" }, { id: "ops" }] } });
+      const result = runCli(
+        [
+          "telegram", "topic", "create",
+          "--group", "-100123", "--name", "Launch", "--agent", "ops",
+        ],
+        {
+          env: {
+            TELEGRAM_BOT_TOKEN: "test-token",
+            ALPHACLAW_TEST_FETCH_MODE: "ok",
+            ALPHACLAW_TEST_FETCH_THREAD_ID: "778",
+            ALPHACLAW_TEST_FETCH_WRITE_PATH: configPath(),
+            ALPHACLAW_TEST_FETCH_WRITE_CONTENT: JSON.stringify({
+              ...kTopLevelConfig,
+              agents: { list: [{ id: "main" }] },
+            }),
+          },
+        },
+      );
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('Unknown agent "ops"');
+      expect(result.stderr).toContain("was created unrouted");
+      const topic = readRegistry().groups["-100123"].topics["778"];
+      expect(topic.name).toBe("Launch");
+      expect(topic.agentId).toBeUndefined();
+    });
+
     it("creates the forum topic, registers it, and syncs config + prompts", () => {
-      writeConfig(kTopLevelConfig);
+      writeConfig({ ...kTopLevelConfig, agents: { list: [{ id: "main" }, { id: "ops" }] } });
       const result = runCli(
         [
           "telegram", "topic", "create",
