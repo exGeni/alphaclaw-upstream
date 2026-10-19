@@ -958,6 +958,32 @@ const syncTelegramWorkspaceArtifacts = ({
   console.log(
     `[alphaclaw] Concurrency updated: agent=${syncResult.maxConcurrent} subagents=${syncResult.subagentMaxConcurrent} topics=${syncResult.totalTopics}`,
   );
+  // The sync rebuilds the whole group's topic routing from the registry:
+  // print what it removed/added/changed so nothing is dropped silently.
+  const { formatTopicChanges } = require("../lib/server/telegram-topic-agents");
+  const changes = formatTopicChanges(syncResult.topicChanges);
+  if (changes) console.log(`[alphaclaw] Topic config changes: ${changes}`);
+  for (const t of syncResult.danglingAgentTopics || []) {
+    console.warn(
+      `[alphaclaw] Warning: topic ${t.threadId} not written: it routes to unknown agent "${t.agentId}"`,
+    );
+  }
+};
+
+// Refuses a topic agent id the config does not know (telegram-topic-agents.js),
+// and one that is not a slug exactly as given (isValidAgentId): "MAIN" or
+// "foo!!!bar" would canonicalize onto a configured agent but persist the raw
+// value (codex). An empty --agent leaves the topic unrouted.
+const checkCliTopicAgentId = ({ cfg, agentId }) => {
+  const raw = agentId == null ? "" : String(agentId);
+  if (raw !== "") {
+    const { isValidAgentId } = require("../lib/server/agents/shared");
+    if (raw !== raw.trim() || !isValidAgentId(raw)) {
+      return `Invalid agent id ${JSON.stringify(raw)} for topic routing (lowercase letters, numbers and hyphens)`;
+    }
+  }
+  const { checkTopicAgentId } = require("../lib/server/telegram-topic-agents");
+  return checkTopicAgentId({ cfg, openclawDir, agentId: raw });
 };
 
 const runTelegramTopicAdd = () => {
@@ -966,7 +992,7 @@ const runTelegramTopicAdd = () => {
   const systemInstructions = String(
     flagValue(commandArgs, "--system") || "",
   ).trim();
-  const agentId = String(flagValue(commandArgs, "--agent") || "").trim();
+  const agentId = String(flagValue(commandArgs, "--agent") || "");
   const requestedGroupId = String(
     flagValue(commandArgs, "--group") || "",
   ).trim();
@@ -991,6 +1017,11 @@ const runTelegramTopicAdd = () => {
       return 1;
     }
     const { groupId, accountId, requireMention } = target;
+    const agentError = checkCliTopicAgentId({ cfg, agentId });
+    if (agentError) {
+      console.error(`[alphaclaw] ${agentError}`);
+      return 1;
+    }
 
     const topicRegistry = require("../lib/server/topic-registry");
     topicRegistry.updateTopic(
@@ -1039,7 +1070,7 @@ const deriveTelegramAccountEnvKey = (accountId) => {
 
 const runTelegramTopicCreate = async () => {
   const topicName = String(flagValue(commandArgs, "--name") || "").trim();
-  const agentId = String(flagValue(commandArgs, "--agent") || "").trim();
+  const agentId = String(flagValue(commandArgs, "--agent") || "");
   const requestedGroupId = String(
     flagValue(commandArgs, "--group") || "",
   ).trim();
@@ -1064,6 +1095,11 @@ const runTelegramTopicCreate = async () => {
       return 1;
     }
     const { groupId, accountId, requireMention } = target;
+    const agentError = checkCliTopicAgentId({ cfg, agentId });
+    if (agentError) {
+      console.error(`[alphaclaw] ${agentError}`);
+      return 1;
+    }
 
     const { createTelegramApi } = require("../lib/server/telegram-api");
     const accountEnvKey = deriveTelegramAccountEnvKey(accountId);
@@ -1087,16 +1123,34 @@ const runTelegramTopicCreate = async () => {
       return 1;
     }
 
+    // Recheck after the Telegram await, as the HTTP create does (codex): the
+    // agent may have been deleted meanwhile; the topic is then registered
+    // unrouted and the command fails with the reason.
+    const lateAgentError = agentId
+      ? checkCliTopicAgentId({ cfg: readCliOpenclawConfig(), agentId })
+      : null;
     const topicRegistry = require("../lib/server/topic-registry");
     topicRegistry.addTopic(
       groupId,
       threadId,
       {
         name: topicName,
-        ...(agentId ? { agentId } : {}),
+        ...(agentId && !lateAgentError ? { agentId } : {}),
       },
       { source: "cli" },
     );
+    if (lateAgentError) {
+      console.error(
+        `[alphaclaw] ${lateAgentError}; topic ${threadId} was created unrouted`,
+      );
+      syncTelegramWorkspaceArtifacts({
+        topicRegistry,
+        groupId,
+        accountId,
+        requireMention,
+      });
+      return 1;
+    }
 
     const agentSuffix = agentId ? ` agent=${agentId}` : "";
     console.log(
