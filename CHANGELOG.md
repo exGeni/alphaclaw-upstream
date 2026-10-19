@@ -741,6 +741,28 @@ variable" row no longer rewrites the key you already typed.
   `export ` prefix) is pasted as typed. The parser moved to
   `lib/public/js/components/envars-paste.js` with unit tests.
 
+## [0.10.8-exgenius.1] - 2026-10-19
+
+exGeni fork line rebuilt on upstream **v0.10.8** (`garrytan/alphaclaw` main
+d045cce, which adds v0.10.6 9595f99, v0.10.7 a297ae4 and v0.10.8 d045cce to
+v0.10.5 3d980c1). OpenClaw moves with upstream's pin from **2026.10.2 to
+2026.10.4** (upstream's own bump, see [0.10.6] below; state schemas unchanged
+at `{ state: 20, agent: 24 }`). The 0.10.5-exgenius.1 entry below stays as the
+record of the previous fork line and its carry table.
+
+### Carried (rebased one commit each, same order, no code conflicts)
+
+Every fork commit of 0.10.5-exgenius.1 (`4f96d100`) is carried unchanged:
+the clawCmd process-group kill and channel CLI timeout (garrytan/alphaclaw#130,
+open), `channels.account-update` DM access, `agents.update` models / skills /
+tier-aware tools, Telegram topic agentId integrity and the non-slug refusals,
+the cgroup working-set pressure fix (garrytan/alphaclaw#132, open), the
+`alphaclaw admin DELETE --data` framing, the two WhatsApp env-sync fixes and
+their tests, and the two `ci(exgenius)` commits. Upstream v0.10.6–v0.10.8 and
+the fork overlap only in `bin/alphaclaw.js` and `lib/server/gateway.js`, in
+disjoint regions. The only textual conflict was the version commit
+(5b3e7d1e), whose bump this entry supersedes.
+
 ## [0.10.8] - 2026-10-16
 
 Honest boot status: while AlphaClaw boots, the dashboard says which stage the
