@@ -923,6 +923,57 @@ and on 2026.10.x that Doctor fails on every symlinked install.
   the live state; it says to run the bridge release on a restored copy in a
   separate directory and says plainly when that needs a backup that may not
   exist.
+## [0.10.5-exgenius.1] - 2026-10-15
+
+exGeni fork line rebuilt on upstream **v0.10.5** (`garrytan/alphaclaw` main
+3d980c1, which adds v0.10.3 577695a, v0.10.4 b54801e and v0.10.5 3d980c1 to
+v0.10.2 bf728c3). OpenClaw moves with upstream's pin from **2026.9.8 to
+2026.10.2** (upstream's own bump, see [0.10.5] below; 2026.10.1 migrates the
+state database to schema 20, so going back means restoring a backup). This
+entry replaces 0.10.2-exgenius.1 and 0.10.2-exgenius.2 as the fork's release
+notes; their texts are kept below.
+
+### Carried (one commit each, cherry-picked with `-x`, same order)
+
+| Fork commit | Change | Upstream PR | Port |
+|---|---|---|---|
+| 98ddb1a | clawCmd kills the whole process group on timeout; channel CLIs get 180 s and an env-ref token (#128, #129) | garrytan/alphaclaw#130 (open) | import conflict in `lib/server/commands.js` only (upstream added `classifyLocalStateOwnerFailure`); both imports kept |
+| ec3e106 | `channels.account-update` sets an account's DM access (`dmPolicy`/`allowFrom`) | none | clean |
+| c11832b | `agents.update` sets per-agent model settings (`models` map) | none | conflict on the dropped #126 helpers next to `toReadableAgent`; resolved without them |
+| f16d244 | `agents.update` sets a per-agent skill allowlist (`skills`) | none | same as c11832b |
+| e244558 | `agents.update` tools is tier-aware; per-agent `allow` and `fs.workspaceOnly` | none | clean |
+| 6ab99fe | Telegram topic agentId integrity; `agents.delete` unroutes topics | none | test-only conflicts: the dropped #126 tests removed; `routes-telegram.test.js` keeps upstream's `gitSync` (0.10.4) beside the topic fixture |
+| bb6e0a1 | container pressure uses the cgroup working set, not page cache (#125) | garrytan/alphaclaw#132 (open) | clean |
+| 8427762 | `alphaclaw admin DELETE … --data` frames the body with `Content-Length` | none | clean |
+| 1aa3abd, 7b2bb41 | env-sync never removes a WhatsApp channel not derived from `WHATSAPP_OWNER_NUMBER` | none | clean (7b2bb41's CHANGELOG hunk left out; this entry restates it) |
+| 0b3ef06 | no root `name` on a flat WhatsApp config; `ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS` | none | clean |
+| 76f5b7f | tests for the two WhatsApp fixes | none | clean |
+| 2cec834, a2fa8c6 | ci(exgenius): unit suite on PRs into `exgenius-*/base`; version guard skipped there | fork CI only | clean |
+
+### Dropped
+
+- **a82b4bb "keep explicit agent ownership free of default markers" (#126,
+  garrytan/alphaclaw#127).** Upstream v0.10.5 rewrote the roster write
+  boundary (`canonicalizeAgentsForWrite`: keyed `agents.entries`, never a
+  `default` marker, explicit ownership on multi-agent rosters, the default
+  agent as `agents.defaults.systemAgent.agentId`) and its CHANGELOG says it
+  "Supersedes the explicit-fleet-only fix in #127". The carried commit's
+  tests, run against pristine v0.10.5: saving an explicit roster without
+  markers and recording the default as `systemAgent` pass; the other three
+  differ only where upstream chose otherwise without losing the protection
+  (in-memory `default: false` markers that the write boundary strips; the
+  last agent is refused as "Default agent cannot be deleted"; the owner
+  refusal names `agents.defaults.authInheritance` without `.agentId`).
+
+### Checked against OpenClaw 2026.10.2
+
+The carried `agents.update` (`models`, `skills`, `tools`),
+`channels.account-update` (DM access) and `agents.delete` (topic unroute)
+writes were run on a temporary config and each result passed the pinned
+`openclaw config validate --json` (`"valid":true`, no warnings).
+`openclaw channels add --channel telegram --token '${TELEGRAM_BOT_TOKEN}'`
+on 2026.10.2 stores the reference as-is (`botToken: "${TELEGRAM_BOT_TOKEN}"`);
+discord and slack were not re-measured.
 
 ## [0.10.5] - 2026-10-12
 
@@ -1152,6 +1203,172 @@ in the live tree and refusing in silence.
 - **Deployed agent guidance** (`core-prompts/AGENTS.md`): commit only the
   paths you changed, integrate with `pull --ff-only` or a merge, never leave
   a rebase or merge in progress (was "always pull first").
+
+## [0.10.2-exgenius.2] - 2026-10-13
+
+exGeni fork patch on top of **0.10.2-exgenius.1**: AlphaClaw stops breaking an
+OpenClaw-native WhatsApp setup (one number, many senders, peer bindings) and
+its admin CLI works for `DELETE`. OpenClaw stays pinned to **2026.9.8**. All
+three defects are present, unchanged, in upstream `garrytan/alphaclaw` main
+(b54801e, v0.10.4); none of them comes from a fork-only commit. Upstream
+filing is a separate step.
+
+### Fixed
+
+- **`alphaclaw admin DELETE … --data` delivers its body:** `cli/admin.js` wrote
+  the body but set no `Content-Length`; Node's `ClientRequest` does not
+  chunk-encode DELETE (nor GET/HEAD/OPTIONS), so the server read an empty
+  body and every body-located DELETE (`agents.binding-remove`, `channels.account-remove`)
+  failed with a missing-field error. A body is now always framed with its byte
+  length. POST/PUT/PATCH are unchanged (they were already chunked); a request
+  without a body still sends no `Content-Length`.
+- **Env-sync no longer deletes an OpenClaw-native WhatsApp config:**
+  `syncChannelConfig` (AlphaClaw boot, every Envars save) ran
+  `channels remove --channel whatsapp --delete` whenever
+  `channels.whatsapp.enabled` was truthy and `WHATSAPP_OWNER_NUMBER` was
+  absent, i.e. for any WhatsApp channel configured outside AlphaClaw (literal
+  `allowFrom`, peer bindings). The removal branch now guards
+  `sync: false` channels (WhatsApp): it runs only when the channel config
+  references the env key (`${WHATSAPP_OWNER_NUMBER}` or a per-account
+  `${WHATSAPP_OWNER_NUMBER_<SUFFIX>}`), i.e. config AlphaClaw derived from the
+  env var. The add branch and the removal of such env-derived config are
+  unchanged. **Behavior change:** the fresh-onboarding WhatsApp config
+  (`onboarding/openclaw.js`) stores the owner number literally, so clearing
+  `WHATSAPP_OWNER_NUMBER` no longer removes it; the 0.10.2-exgenius.1 test that
+  pinned the old behavior (`{ whatsapp: { enabled: true } }` is removed) is
+  replaced by tests for the native and the env-referencing cases.
+- **`channels.account-update` no longer writes `channels.whatsapp.name`:** on a
+  flat (legacy default) WhatsApp config the rename wrote `name` at the channel
+  root, which the strict WhatsApp plugin schema rejects (`name` is valid only
+  under `accounts.<id>`), leaving an invalid config. The root write is skipped
+  for WhatsApp; named accounts still get `accounts.<id>.name`; Telegram,
+  Discord and Slack are unchanged. (The update still re-binds the account to
+  the selected agent, as before, and still echoes the requested name in its
+  response; for a flat WhatsApp config that name is not persisted.)
+
+### Added
+
+- **`ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS`** (default `12000`, read per call, same
+  parsing as `ALPHACLAW_CHANNEL_CMD_TIMEOUT_MS`): how long the WhatsApp QR login
+  op waits for the login CLI to print the QR. The CLI itself still outlives the
+  call (leader-only kill). Default behavior is unchanged.
+
+### Tests
+
+- `tests/bin/admin-cli.test.js`: DELETE body + `Content-Length` (incl. multibyte),
+  POST intact, no `Content-Length` without a body.
+- `tests/server/gateway.test.js`: native WhatsApp config (with and without
+  `enabled`, with peer bindings) and the fresh-onboarding shape are never removed
+  (modes `remove` and `all`), env-referencing config (base and per-account
+  suffix) is still removed, other channels keep their behavior.
+- `tests/server/agents-service-coverage.test.js`: no root `name` on a flat
+  WhatsApp config, `accounts.<id>.name` still written, login window knob.
+
+## [0.10.2-exgenius.1] - 2026-10-12
+
+exGeni fork line rebuilt on upstream **v0.10.2** (`garrytan/alphaclaw` main
+bf728c3, which adds v0.10.1 b240b48 and v0.10.2 bf728c3 to v0.10.0 6bb4575;
+OpenClaw stays pinned to **2026.9.8**, unchanged). The upstream base replaces
+the v0.10.0 base of 0.10.0-exgenius.1; the eight fork-only commits
+are carried unchanged, one commit each, in the same order (cherry-picks of
+aa18aeb 0dc4f18 47df261 79b4255 c197a48 4b9a84d 19e1194 7eef8e6; every one
+applied without a conflict). None of them is in upstream v0.10.2: #126,
+#128/#129 and #125 are still open upstream PRs (garrytan/alphaclaw#127, #130,
+#132), the rest are fork-only. The 0.10.0..0.10.2 upstream diff touches none
+of the files the carried commits change except the release metadata
+(`CHANGELOG.md`, `README.md`, `package.json`, `package-lock.json`).
+
+Restart path (upstream v0.10.1/v0.10.2: zombie-aware liveness, the `lsof` shim
+on the ask's PATH, kill-set evidence, failure-to-watchdog handoff, banner and
+incident linkage) is taken as is. The stop ladder spawns its own
+`openclaw gateway restart` and never goes through `clawCmd`, so the clawCmd
+group-kill change still stands. The shared paths through `clawCmd` are the
+watchdog's restart-handoff consume (`gateway-restart-handoff.js`, now gets the
+group kill on its 5 s timeout and settles up to about 5 s later instead of
+leaving an orphaned consume CLI) and the watchdog's `doctor --fix` fallback.
+
+The entries below are restated from 0.10.0-exgenius.1. Facts they
+state about OpenClaw 2026.9.5 were measured on 2026.9.5 and are not re-verified
+on 2026.9.8 by this port.
+
+### Carried from -exgenius.8 (2026-10-01)
+
+#### Fixed
+
+- **Container memory critical no longer fires on page cache (#125, upstream PR pending):** container pressure (the `container_critical` latch and the container side of the gateway growth predicate) now uses the cgroup working set, `memory.current` minus `inactive_file` from the same cgroup's `memory.stat` (`total_inactive_file` on cgroup v1), as `docker stats` reports it. Raw usage stays in `usedBytes` for Resources, and stands in when `memory.stat` is unreadable or inactive file pages are not below usage. The alert, Doctor card and Watchdog row name the working set.
+
+### Carried from -exgenius.7 (2026-10-01)
+
+#### Fixed
+
+- **Telegram topics can no longer route to an agent that does not exist.** OpenClaw 2026.9.5 uses a topic `agentId` as is, and `openclaw config validate` accepts one that names no agent.
+  - Topic writes (`POST`/`PUT /api/telegram/groups/:g/topics…`, `…/topics/bulk`, `alphaclaw telegram topic add|create --agent`) refuse an id that is not a configured agent (400 / exit 1) before any Telegram call or write. Ids compare in OpenClaw's canonical form; an empty id still unroutes.
+  - `agents.delete` unroutes the agent's topics in the topic registry and in `openclaw.json` and returns them in `unroutedTopics`. A registry that cannot be cleared refuses the delete, which stays retryable.
+- **Topic syncs no longer drop config silently.** `syncConfigForTelegram` rebuilds a group's topics from the registry; every topic write now returns `topicChanges` (removed/added/changed thread ids) and `danglingAgentTopics`, and the CLI prints them. A registry topic routed to an unknown agent is no longer written to `openclaw.json` (decided under the config lock, so a concurrent agent delete cannot slip one in); it is reported in `danglingAgentTopics`.
+- Corrupt `openclaw.json`/topic registry on these paths answers the fail-closed 503, and a failed config write during `agents.delete` puts the registry routes back.
+
+### Carried from -exgenius.6 (2026-10-01)
+
+Fork versioning: exGeni fork releases now carry the upstream base plus an `-exgenius.N` suffix (upstream `main` is 0.9.95). The fork's earlier 0.9.96–0.9.100 releases map to `-exgenius.1` (#126) to `.5` (per-agent skills); they are not renumbered in history.
+
+#### Changed
+
+- **Tier-aware per-agent tools on `agents.update`** (`PUT /api/agents/:id`, field `tools`, OpenClaw `agents.entries.<id>.tools`).
+  - Narrowing is write-tier: more `deny` entries, a smaller effective `alsoAllow`, an `allow` list inside the current one (or a new one naming only core tools/groups), the same effective profile or a move away from `full`, `fs.workspaceOnly` turned on. Any other profile change is dangerous: plugins can declare tools per profile, so only `full` is provably a superset.
+  - Anything else is dangerous-tier (confirm code), including `tools: null`, removing deny entries, adding `alsoAllow`, a broader profile, and a new `allow` naming a plugin tool, `group:plugins` or `*` (that opts optional plugin tools in). The tier is computed against the config on disk with the same function the service writes with, and fails closed.
+- `tools` accepts per-agent `allow` (strict allowlist; refused with `alsoAllow` and when empty, since OpenClaw reads an empty allow as every tool) and `fs.workspaceOnly` (`true`/`false`/`null`, patched field by field). Both validate with OpenClaw 2026.9.5.
+- `profile`/`alsoAllow`/`deny` are replaced together (an own `alsoAllow: []` is kept, overriding the global `tools.alsoAllow`); `allow` is kept when omitted unless the patch supplies `alsoAllow`, `allow: null` removes it. Per-agent tools keys AlphaClaw does not manage (`elevated`, `exec`, `byProvider`, ...) are now kept instead of dropped. Unknown keys, unknown profiles and non-object `tools` are refused (400).
+
+### Carried from 0.9.100 = -exgenius.5 (2026-09-30)
+
+#### Added
+
+- **Per-agent skill allowlist through AlphaClaw:** `PUT /api/agents/:id` (`agents.update`) accepts `skills`, which sets OpenClaw's `agents.entries.<id>.skills`.
+  - A list becomes the agent's exact skill set and replaces the defaults; `[]` exposes no skills; `null` inherits `agents.defaults.skills`.
+  - Narrowing is a write-tier admin op. Widening beyond the agent's current effective set, or removing the list, is dangerous-tier.
+
+### Carried from fork 0.9.99 = -exgenius.4 (2026-09-30)
+
+#### Added
+
+- **Per-agent model runtime through AlphaClaw:** `PUT /api/agents/:id` (`agents.update`) accepts an optional `models` map keyed by `provider/model`. Each entry may carry `agentRuntime.id` (`openclaw`, `claude-cli`, `codex`, `copilot` or `auto`), `params` and `codeMode`. This lets one agent run a model on a different runtime without changing `agents.defaults`.
+  - Updates patch each entry field by field: a supplied field replaces that field, and a field set to `null` is removed. Omitted fields are kept, including `alias`, `streaming` and `pickerRuntimes`.
+  - An entry set to `null` removes that model's settings, and `models: null` clears the whole map.
+  - Unknown runtime ids and unknown keys are refused. OpenClaw 2026.9.5 accepts any runtime id, so AlphaClaw checks it.
+  - `codeMode` is refused on wildcard model refs, which OpenClaw rejects.
+  - Moving a model to a runtime other than `openclaw` is a dangerous-tier admin op. So is removing an entry or its runtime, because that can fall back to a non-`openclaw` default.
+
+### Carried from fork 0.9.98 = -exgenius.3 (2026-09-30)
+
+#### Added
+
+- **Channel account DM access through AlphaClaw:** `PUT /api/channels/accounts` (admin op `channels.account-update`) accepts optional `dmPolicy` (`pairing`/`allowlist`/`open`/`disabled`) and `allowFrom` for Telegram, Discord and Slack accounts. Operators no longer need `openclaw config set` to make an account public or change its DM allowlist.
+  - Only the fields supplied are written; inherited channel-level values stay inherited, and legacy `dm.policy`/`dm.allowFrom` are read and replaced.
+  - The rules follow OpenClaw's access-control docs, checked on the effective values. AlphaClaw enforces them itself, because OpenClaw 2026.9.5 does not check them per account:
+    - `open` requires `"*"`;
+    - `"*"` is allowed only with `open`;
+    - `allowlist` requires a sender id;
+    - Telegram refuses `open` under a channel-level allowlist.
+  - On Telegram, `"*"` must not widen group access. Group sender auth falls back to `allowFrom`, so when the account admits groups and has no explicit `groupAllowFrom`, it is pinned to the previous sender list. If there is none, the request is refused.
+  - Making an account public is a dangerous-tier admin op (confirm code).
+  - Nothing is written when validation fails, and no restart is needed.
+
+### Carried from 0.9.97 = -exgenius.2 (2026-09-30)
+
+#### Fixed
+
+- **Timed-out OpenClaw CLIs no longer survive as orphans:** `clawCmd` ran `openclaw` through `exec` with its `timeout` option, which signals only the `/bin/sh -c` wrapper. dash does not exec the last command, so the `openclaw` process kept running under PID 1 and held OpenClaw's state lifecycle while AlphaClaw had already reported failure and started a rollback. Timed-out `pairing list` CLIs piled up behind the `/api/pairings` single-flight for the same reason.
+  - `clawCmd` now spawns the wrapper in its own process group. On timeout it signals the whole group, sends SIGKILL after a 5 s grace, and settles only once no group member can write.
+  - The WhatsApp QR login keeps the old leader-only kill (`killScope: "leader"`), because its CLI must finish linking after the call returns.
+  - Output is capped at 16 MiB (`exec` capped it at 1 MiB). An overflow still fails as `ERR_CHILD_PROCESS_STDIO_MAXBUFFER`.
+- **Channel account creation survives slow OpenClaw CLIs:** `channels add`, `agents bind` and `channels remove` now use a 180 s timeout instead of a hardcoded 30 s. `ALPHACLAW_CHANNEL_CMD_TIMEOUT_MS` overrides it.
+- **The channel token stays out of argv:** `channels add` now receives the `${…}` env reference for Telegram, Discord and Slack tokens instead of the secret itself.
+
+### Carried from 0.9.96 = -exgenius.1 (2026-09-30)
+
+#### Fixed
+
+- **Explicit agent ownership survives agents-domain writes (#126):** on an `agents.ownership: "explicit"` fleet (what `openclaw doctor --fix` writes), roster saves no longer stamp `default: true` or add an implicit `main` entry, and a stray `default: true` is dropped. OpenClaw rejects that marker next to explicit ownership, so any agent, binding, channel-account or model save after `doctor --fix` used to leave a config the gateway would not start on (exit 78) and doctor could not repair. On such fleets "Set as default" now records `agents.defaults.systemAgent.agentId`, the agent list derives its default badge from it, and deleting refuses the last agent or any agent named by `agents.defaults.{systemAgent,heartbeat,authInheritance,sessionStore}.agentId`. Rosters without `ownership` behave as before.
 
 ## [0.10.2] - 2026-10-11
 
