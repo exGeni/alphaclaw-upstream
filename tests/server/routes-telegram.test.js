@@ -535,6 +535,33 @@ describe("server/routes/telegram", () => {
     expect(topics["11"].agentId).toBe("main");
   });
 
+  it("single create rechecks the agent after the Telegram await and still syncs the unrouted topic (codex)", async () => {
+    writeOpenclawJson({ agents: { list: [{ id: "main" }, { id: "scout" }] } });
+    writeRegistryFile({ version: 2, meta: { sweepWatermark: 0 }, groups: { "-100": { name: "G", topics: {} } } });
+    const telegramApi = makeTelegramApi({
+      createForumTopic: vi.fn(async (chatId, name) => {
+        // scout is deleted while the Telegram call is pending.
+        writeOpenclawJson({ agents: { list: [{ id: "main" }] } });
+        return { message_thread_id: 12, name, icon_color: 1 };
+      }),
+    });
+    const { app, syncPromptFiles, gitSync } = createApp({ telegramApi });
+    const res = await request(app)
+      .post("/api/telegram/groups/-100/topics")
+      .send({ name: "Late", agentId: "scout", systemPrompt: "Be brief" });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("created unrouted");
+    const topic = readRegistryFile().groups["-100"].topics["12"];
+    expect(topic.agentId).toBeUndefined();
+    expect(topic.systemInstructions).toBe("Be brief");
+    // The unrouted topic's instructions reach openclaw.json and the
+    // workspace, as on the success path.
+    const cfg = readOpenclawJson();
+    expect(cfg.channels.telegram.groups["-100"].topics["12"]).toEqual({ systemPrompt: "Be brief" });
+    expect(syncPromptFiles).toHaveBeenCalled();
+    expect(gitSync).toHaveBeenCalledWith({ message: "telegram workspace: create-topic Late" });
+  });
+
   it("update rechecks the agent after the Telegram rename and keeps the old routing (codex)", async () => {
     writeOpenclawJson({ agents: { list: [{ id: "main" }, { id: "scout" }] } });
     writeRegistryFile({ version: 2, meta: { sweepWatermark: 0 }, groups: { "-100": { name: "G", topics: { 5: { name: "Ops", agentId: "main" } } } } });

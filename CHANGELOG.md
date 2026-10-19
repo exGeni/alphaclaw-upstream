@@ -763,6 +763,15 @@ the fork overlap only in `bin/alphaclaw.js` and `lib/server/gateway.js`, in
 disjoint regions. The only textual conflict was the version commit
 (5b3e7d1e), whose bump this entry supersedes.
 
+### Fixed
+
+- `POST /api/telegram/groups/:groupId/topics`: when the requested agent is
+  deleted while Telegram creates the topic, the topic is registered unrouted
+  as before, and now it is also synced (`openclaw.json`, prompt files, git
+  sync) before the 409, as the update route already did. Before, its
+  `systemInstructions` stayed out of `openclaw.json` until an unrelated later
+  sync (Codex review on fork PR #7).
+
 ## [0.10.8] - 2026-10-16
 
 Honest boot status: while AlphaClaw boots, the dashboard says which stage the
