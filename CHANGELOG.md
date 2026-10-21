@@ -5,6 +5,38 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.14] - 2026-10-20
+
+The Control UI at `/openclaw` now connects on every hostname an install is
+reached by. Before, it rendered but every gateway connect was refused with
+"Browser origin not allowed" unless the browser was on the one origin boot
+wrote into `gateway.controlUi.allowedOrigins`. That broke Railway and Render
+custom domains, a second hostname next to `ALPHACLAW_SETUP_URL`, a VPS reached
+by name or IP, and ingresses that rewrite `Host`.
+
+### Fixed
+
+- **Same-origin Control UI connects from any hostname**
+  (`resolveGatewayBrowserOrigin` in `lib/server/control-ui-mount.js`). The
+  gateway's same-host origin rule can never match behind AlphaClaw, because the
+  proxy rewrites `Host` to the gateway's loopback address. When a request's
+  `Origin` host equals the host it was sent to (`Host`, or `X-Forwarded-Host`
+  from an edge), AlphaClaw now presents the canonical origin boot pinned into
+  the allowlist on the WebSocket upgrade and on proxied HTTP. A browser cannot
+  forge either header, so this is the same-origin proof the allowlist exists
+  for. A cross-origin `Origin` passes through untouched and the gateway's
+  allowlist still decides it. The config and the gateway are unchanged.
+
+### Tests
+
+- `tests/live/control-ui-hostnames.e2e.test.js` (live tier, real Chromium and
+  real gateway): with one pinned origin, a second hostname and a Host-rewriting
+  ingress each reach `hello-ok` and complete a chat turn against a mock
+  OpenAI-compatible model. It fails on 0.10.8 with
+  `CONTROL_UI_ORIGIN_NOT_ALLOWED`.
+- Unit and wiring coverage for the resolver, the WebSocket catch-all and the
+  HTTP proxy.
+
 ## [0.10.13] - 2026-10-20
 
 Upstream sync (chrysb/alphaclaw `3349d7b8` preflight trigger): legacy
