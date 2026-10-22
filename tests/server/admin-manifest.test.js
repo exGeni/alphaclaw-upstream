@@ -597,3 +597,194 @@ describe("admin-manifest stale entries and inline routes (F068, F069, F070, F225
     expect(op).toMatchObject({ id: "updates.capabilities", tier: "safe", domain: "updates" });
   });
 });
+
+describe("channels.account-update tier", () => {
+  it("escalates making an account public to dangerous", () => {
+    const { tierResolver } = require("../../lib/server/admin-manifest/domains/channels.js").ops.find(
+      (op) => op.id === "channels.account-update",
+    );
+    expect(typeof tierResolver).toBe("function");
+    expect(tierResolver({ body: { dmPolicy: "open", allowFrom: ["*"] } })).toBe("dangerous");
+    expect(tierResolver({ body: { allowFrom: [" * "] } })).toBe("dangerous");
+    expect(tierResolver({ body: { dmPolicy: "allowlist", allowFrom: ["123"] } })).toBe("restart");
+    expect(tierResolver({ body: { name: "X", agentId: "main" } })).toBe("restart");
+  });
+});
+
+describe("agents.update tier", () => {
+  it("escalates moving a model off the embedded openclaw runtime to dangerous", () => {
+    const { tierResolver } = require("../../lib/server/admin-manifest/domains/agents.js").ops.find(
+      (op) => op.id === "agents.update",
+    );
+    const body = (id) => ({ body: { models: { "anthropic/claude-sonnet-5-5": { agentRuntime: { id } } } } });
+    expect(tierResolver(body("openclaw"))).toBe("write");
+    expect(tierResolver(body("claude-cli"))).toBe("dangerous");
+    expect(tierResolver(body("auto"))).toBe("dangerous");
+    // Any removal may fall back to a non-openclaw agents.defaults runtime.
+    expect(tierResolver({ body: { models: { "a/b": null } } })).toBe("dangerous");
+    expect(tierResolver({ body: { models: null } })).toBe("dangerous");
+    expect(tierResolver({ body: { models: { "a/b": { agentRuntime: null } } } })).toBe("dangerous");
+    // Field patches without agentRuntime keep the existing runtime.
+    expect(tierResolver({ body: { models: { "a/b": { codeMode: false } } } })).toBe("write");
+    expect(tierResolver({ body: { name: "X" } })).toBe("write");
+  });
+});
+
+describe("agents.update skills tier", () => {
+  const { createSkillsTier } = require("../../lib/server/admin-manifest/domains/agents.js");
+  const tierFor = (cfg) => createSkillsTier({ readConfig: () => cfg });
+  // Express shape under app.use("/api", enforcement): mount-trimmed path.
+  const req = (skills) => ({ baseUrl: "/api", path: "/agents/reception", body: { skills } });
+
+  it("narrowing is write; widening or removing is dangerous", () => {
+    const cfg = { agents: { list: [{ id: "reception", skills: ["faq", "grant-intake"] }] } };
+    const tier = tierFor(cfg);
+    expect(tier(req(["faq"]))).toBe("write");
+    expect(tier(req([]))).toBe("write");
+    expect(tier(req(["faq", "github"]))).toBe("dangerous");
+    expect(tier(req(null))).toBe("dangerous");
+    expect(tier({ baseUrl: "/api", path: "/agents/reception", body: { name: "X" } })).toBe("write");
+  });
+
+  it("compares against inherited defaults, and any list narrows an unrestricted agent", () => {
+    const inherited = tierFor({ agents: { defaults: { skills: ["github"] }, list: [{ id: "reception" }] } });
+    expect(inherited(req(["github"]))).toBe("write");
+    expect(inherited(req(["weather"]))).toBe("dangerous");
+    const unrestricted = tierFor({ agents: { list: [{ id: "reception" }] } });
+    expect(unrestricted(req(["anything"]))).toBe("write");
+  });
+
+  it("fails closed on unreadable config or a non-list own skills value", () => {
+    expect(() => tierFor(null)(req(["x"]))).toThrow("config unreadable");
+    expect(() =>
+      tierFor({ agents: { list: [{ id: "reception", skills: null }] } })(req(["x"])),
+    ).toThrow("agent skills is not a list");
+  });
+});
+
+describe("agents.update tools tier", () => {
+  const { createToolsTier } = require("../../lib/server/admin-manifest/domains/agents.js");
+  const tierFor = (cfg) => createToolsTier({ readConfig: () => cfg });
+  const req = (tools) => ({ baseUrl: "/api", path: "/agents/reception", body: { tools } });
+  const withTools = (tools, globalTools) => ({
+    ...(globalTools ? { tools: globalTools } : {}),
+    agents: { list: [{ id: "main" }, { id: "reception", ...(tools ? { tools } : {}) }] },
+  });
+
+  it("is write when the body has no tools", () => {
+    expect(tierFor(withTools({ profile: "messaging" }))({ ...req(), body: { name: "X" } })).toBe("write");
+  });
+
+  it("deny: adding entries is write, removing any is dangerous", () => {
+    const tier = tierFor(withTools({ profile: "messaging", deny: ["exec"] }));
+    expect(tier(req({ profile: "messaging", deny: ["exec", "write"] }))).toBe("write");
+    expect(tier(req({ profile: "messaging", deny: ["EXEC", "write"] }))).toBe("write");
+    expect(tier(req({ profile: "messaging" }))).toBe("dangerous");
+    expect(tier(req({ profile: "messaging", deny: ["write"] }))).toBe("dangerous");
+  });
+
+  it("alsoAllow: shrinking is write, adding is dangerous; removal falls back to the global alsoAllow", () => {
+    const tier = tierFor(withTools({ profile: "minimal", alsoAllow: ["read", "message"] }));
+    expect(tier(req({ profile: "minimal", alsoAllow: ["read"] }))).toBe("write");
+    expect(tier(req({ profile: "minimal" }))).toBe("write");
+    expect(tier(req({ profile: "minimal", alsoAllow: ["read", "exec"] }))).toBe("dangerous");
+    const globalWide = tierFor(withTools({ profile: "minimal", alsoAllow: ["read"] }, { alsoAllow: ["exec"] }));
+    expect(globalWide(req({ profile: "minimal" }))).toBe("dangerous");
+    expect(globalWide(req({ profile: "minimal", alsoAllow: [] }))).toBe("write"); // own [] overrides the global
+  });
+
+  it("profile: unchanged or moving away from full is write; any other change is dangerous (plugins may declare tools per profile, codex)", () => {
+    const tier = tierFor(withTools({ profile: "coding" }));
+    expect(tier(req({ profile: "coding" }))).toBe("write");
+    expect(tier(req({ profile: "minimal" }))).toBe("dangerous");
+    expect(tier(req({ profile: "messaging" }))).toBe("dangerous");
+    expect(tier(req({ profile: "full" }))).toBe("dangerous");
+    expect(tier(req({}))).toBe("dangerous");
+    const full = tierFor(withTools({ profile: "full" }));
+    expect(full(req({ profile: "minimal" }))).toBe("write");
+    // Unset agent profile inherits tools.profile.
+    const inherits = tierFor(withTools(undefined, { profile: "messaging" }));
+    expect(inherits(req({ profile: "messaging", deny: ["exec"] }))).toBe("write");
+    expect(inherits(req({ profile: "coding" }))).toBe("dangerous");
+    const unrestricted = tierFor(withTools(undefined));
+    expect(unrestricted(req({ profile: "coding" }))).toBe("dangerous");
+  });
+
+  it("allow: adding a strict list or shrinking it is write; growing or removing it is dangerous", () => {
+    const open = tierFor(withTools({ profile: "messaging" }));
+    expect(open(req({ profile: "messaging", allow: ["message"] }))).toBe("write");
+    const strict = tierFor(withTools({ profile: "messaging", allow: ["message", "sessions_list"] }));
+    expect(strict(req({ profile: "messaging", allow: ["message"] }))).toBe("write");
+    expect(strict(req({ profile: "messaging", allow: ["message", "exec"] }))).toBe("dangerous");
+    expect(strict(req({ profile: "messaging" }))).toBe("write"); // omitted allow is kept
+    expect(strict(req({ profile: "messaging", allow: null }))).toBe("dangerous");
+    expect(strict(req({ profile: "messaging", alsoAllow: ["message"] }))).toBe("dangerous");
+  });
+
+  it("a new allow list is write only for core tools: a plugin tool, group:plugins or * may opt in an optional plugin tool (refuter)", () => {
+    const unset = tierFor(withTools(undefined));
+    expect(unset(req({ allow: ["read", "group:messaging"] }))).toBe("write");
+    expect(unset(req({ allow: ["optional_plugin_tool"] }))).toBe("dangerous");
+    expect(unset(req({ allow: ["group:plugins"] }))).toBe("dangerous");
+    expect(unset(req({ allow: ["*"] }))).toBe("dangerous");
+    expect(unset(req({ allow: ["read", "*"] }))).toBe("dangerous");
+    // Already granted through the effective alsoAllow: no new opt-in.
+    const granted = tierFor(withTools({ profile: "minimal", alsoAllow: ["optional_plugin_tool", "read"] }));
+    expect(granted(req({ profile: "minimal", allow: ["optional_plugin_tool"] }))).toBe("write");
+  });
+
+  it("fs.workspaceOnly: turning it on is write; off or removing it is dangerous (agent value overrides the global)", () => {
+    const off = tierFor(withTools({ profile: "messaging" }));
+    expect(off(req({ profile: "messaging", fs: { workspaceOnly: true } }))).toBe("write");
+    const on = tierFor(withTools({ profile: "messaging", fs: { workspaceOnly: true } }));
+    expect(on(req({ profile: "messaging" }))).toBe("write"); // omitted fs is kept
+    expect(on(req({ profile: "messaging", fs: { workspaceOnly: false } }))).toBe("dangerous");
+    expect(on(req({ profile: "messaging", fs: null }))).toBe("dangerous");
+    const globalOn = tierFor(withTools({ profile: "messaging" }, { fs: { workspaceOnly: true } }));
+    expect(globalOn(req({ profile: "messaging", fs: { workspaceOnly: false } }))).toBe("dangerous");
+    expect(globalOn(req({ profile: "messaging", fs: { workspaceOnly: null } }))).toBe("write");
+  });
+
+  it("tools: null is dangerous; an invalid patch is write (the route rejects it, nothing is written)", () => {
+    const tier = tierFor(withTools({ profile: "messaging", deny: ["exec"] }));
+    expect(tier(req(null))).toBe("dangerous");
+    expect(tier(req({ allow: ["read"], alsoAllow: ["exec"] }))).toBe("write");
+    expect(tier(req({ profile: "bogus" }))).toBe("write");
+  });
+
+  it("keeps keys AlphaClaw does not manage, so a narrowing patch beside them stays write", () => {
+    const tier = tierFor(withTools({ profile: "coding", elevated: { enabled: false } }));
+    expect(tier(req({ profile: "coding", deny: ["exec"] }))).toBe("write");
+  });
+
+  it("compares a rosterless implicit agent against agents.defaults.tools", () => {
+    const tier = createToolsTier({
+      readConfig: () => ({ agents: { defaults: { tools: { profile: "coding", deny: ["exec"] } } } }),
+    });
+    const mainReq = (tools) => ({ baseUrl: "/api", path: "/agents/main", body: { tools } });
+    expect(tier(mainReq({ profile: "coding", deny: ["exec", "write"] }))).toBe("write");
+    expect(tier(mainReq({ profile: "coding" }))).toBe("dangerous");
+  });
+
+  it("fails closed on an unreadable config or a non-object own tools value", () => {
+    expect(() => tierFor(null)(req({ profile: "minimal" }))).toThrow("config unreadable");
+    expect(() =>
+      tierFor({ agents: { list: [{ id: "reception", tools: ["exec"] }] } })(req({ profile: "minimal" })),
+    ).toThrow("agent tools is not an object");
+  });
+
+  it("the agents.update op resolves widening tools to dangerous through its tierResolver", () => {
+    const openclawConfig = require("../../lib/server/openclaw-config");
+    const spy = vi.spyOn(openclawConfig, "readOpenclawConfig").mockReturnValue(
+      withTools({ profile: "messaging", deny: ["exec"] }),
+    );
+    try {
+      const { findOp, resolveTier } = require("../../lib/server/admin-manifest");
+      const op = findOp("PUT", "/api/agents/reception");
+      expect(resolveTier(op, req({ profile: "messaging", deny: ["exec", "write"] }))).toBe("write");
+      expect(resolveTier(op, req({ profile: "messaging" }))).toBe("dangerous");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
