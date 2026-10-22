@@ -5,6 +5,40 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.57-exgenius.1] - 2026-10-22
+
+exGeni fork line rebuilt on upstream **v0.10.57** (`garrytan/alphaclaw` main
+96c27df5, which adds v0.10.9–v0.10.57 to v0.10.8 d045cce). OpenClaw moves with
+upstream's pin from **2026.10.4 to 2026.10.6** (upstream's own bump, see
+[0.10.48] below): the agent schema goes 24 → 25 (state stays 20), the upgrade
+is one-way, and the Node floor is now `>=24.22.1 <25 || >=26.12.1`. The
+0.10.8-exgenius.1 and 0.10.5-exgenius.1 entries below stay as the record of
+the previous fork lines.
+
+### Dropped (now upstream)
+
+- The clawCmd process-group kill and channel CLI timeout (16816749): upstream
+  ported garrytan/alphaclaw#130 as v0.10.20 (91658253), with the same files.
+- The cgroup working-set pressure fix (6ad43de9): upstream ported
+  garrytan/alphaclaw#132 as v0.10.19 (e40cfd4e).
+
+### Carried (rebased one commit each, same order)
+
+The other 17 fork commits of 0.10.8-exgenius.1 (`c7311f0e`) are carried:
+`channels.account-update` DM access, `agents.update` models / skills /
+tier-aware tools, Telegram topic agentId integrity and the non-slug refusals,
+the late-agent topic sync, the `alphaclaw admin DELETE --data` framing, the two
+WhatsApp env-sync fixes and their tests, and the two `ci(exgenius)` commits.
+Upstream's refactor wave (v0.10.21–v0.10.47) moved code under four of them; each
+was ported, not changed:
+
+| Fork commit | Conflict | Port |
+|---|---|---|
+| b35d27c5 topic agentId integrity | the Telegram topic CLI moved from `bin/alphaclaw.js` to `lib/cli/telegram-topics.js` (#159–#186) | the topic-change report, `checkCliTopicAgentId` and its two call sites go into `lib/cli/telegram-topics.js`; the `clearAgentReferences` test block applies 50 lines higher (upstream dropped `getTopicsForAgent` tests) |
+| fe7f1f0c WhatsApp login window | upstream's #130 port placed the channel CLI timeout constants elsewhere in `lib/server/constants.js` | the login-window constants and exports sit after upstream's channel CLI timeout |
+| 7353525b CLI non-slug refusal and late recheck | same CLI move | applied to `lib/cli/telegram-topics.js` |
+| 06a5818d 0.10.8-exgenius.1 version | `package.json`, lock and changelog | keeps only its changelog entry; this entry supersedes the version bump |
+
 ## [0.10.57] - 2026-10-22
 
 A routine restart lets OpenClaw finish its active work for up to 3 minutes before stopping it, and the restart card offers Restart now (ALPH-17, PR 5 of the restart plan).
