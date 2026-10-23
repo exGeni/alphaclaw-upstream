@@ -192,6 +192,26 @@ describe("server/startup", () => {
     errorSpy.mockRestore();
   });
 
+  it("a failing env read skips the channel sync (nothing is removed) and still launches the gateway", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const deps = createBootDeps({
+      readEnvFile: vi.fn(() => {
+        throw Object.assign(new Error("EACCES: permission denied, open '/data/.env'"), {
+          code: "EACCES",
+        });
+      }),
+    });
+
+    await runOnboardedBootSequence(deps);
+
+    expect(deps.syncChannelConfig).not.toHaveBeenCalled();
+    expect(deps.startGateway).toHaveBeenCalledTimes(1);
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Boot channel sync failed: EACCES"),
+    );
+    errorSpy.mockRestore();
+  });
+
   it("logs and continues when the ensure steps fail", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const deps = createBootDeps({

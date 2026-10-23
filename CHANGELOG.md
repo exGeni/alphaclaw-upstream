@@ -5,6 +5,23 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.68] - 2026-10-23
+
+A failed `.env` read no longer removes channels or drops keys when AlphaClaw reads the file to write it back.
+
+### Fixed
+- `readEnvFile()` returns `[]` on any read error. The boot channel sync (`syncChannelConfig(readEnvFile())`) then saw no bot tokens and ran `openclaw channels remove --channel <name> --delete` for each enabled managed channel (Telegram, Discord, Slack, WhatsApp, ClickClack). This needs a read that fails after the process's own early `.env` load: a transient error in the boot window, or a failure present when an admin runs Retry upgrade (with an eligible failed migration record) or when the onboarding-completion run fires. The boot and Retry upgrade convergence now read with `readEnvFileStrict`: a real read failure throws into the existing `try/catch`, which logs "channel sync failed" and lets the sequence continue to launch the gateway. A missing file still reads as empty.
+- `PUT /api/env` strips the managed channel keys (Telegram, Discord, Slack, WhatsApp) from the request and takes them, the locked keys and the hidden known keys from the file, in three separate lenient reads. When a read failed, the route ran `channels remove --delete` for each enabled channel and then replaced `.env` without the keys of the group that was not read. The route now reads the file once, strictly: a real read failure ends in the route's existing 500 before any removal or write.
+- `updateEnvFile` (the locked read-modify-write behind the Watchdog settings save) read leniently and wrote back only the changed keys after a failed read. It now reads strictly and throws; its one caller, the Watchdog settings route, already answers such an error with 400.
+- Saving a non-empty model API key that triggers the env sync (`PUT /api/models/auth/:id`, `PUT /api/models/config`) read `.env` leniently and wrote back only the profile keys it changed. It now reads strictly and the route answers its existing 500. Auth-profile changes made earlier in the same request are not rolled back.
+- This applies the `AGENTS.md` rule "Every state-file reader that feeds a write fails CLOSED" to `.env`, which the 0.9.74 "Config wipes from fail-open reads" wave did not cover. A missing file still reads as empty.
+
+### Tests
+- `tests/server/startup.test.js`: a throwing env read skips the channel sync, logs it, and the sequence still reaches the gateway launch.
+- `tests/server/routes-system.test.js`: a failing strict read answers 500 with no channel sync, no write and no reload; the preserved locked, hidden and managed keys come from the strict read.
+- `tests/server/routes-models.test.js`: a failing strict read while syncing a model API key answers 500 with no `.env` write.
+- `tests/server/env.test.js`: `updateEnvFile` throws and leaves the path untouched when the read fails (EISDIR).
+
 ## [0.10.67] - 2026-10-23
 
 ### Documentation
