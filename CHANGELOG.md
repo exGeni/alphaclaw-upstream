@@ -5,6 +5,16 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.68] - 2026-10-23
+
+Editing or rebinding a flat WhatsApp channel no longer writes a `name` key that the WhatsApp plugin schema rejects.
+
+### Fixed
+- `channels.account-update` (a channel edit or rebind in the Setup UI, and `alphaclaw admin`; `name` is required on every call) wrote `channels.whatsapp.name` when the WhatsApp channel uses the flat, single-account shape. The strict WhatsApp plugin config schema allows `name` only under `accounts.<id>` and rejects it at the channel root (`additionalProperties: false`), so the rewritten channel config does not match that schema (plugin 2026.10.6). A flat WhatsApp channel, which fresh onboarding also writes, now keeps its root config unchanged. Named accounts still get `accounts.<id>.name`, and Telegram, Discord, Slack and ClickClack still get the root `name`. The response still echoes the requested name; for a flat WhatsApp config that name is not persisted.
+
+### Tests
+- `tests/server/agents-service-coverage.test.js`: a flat WhatsApp update leaves the channel config unchanged and writes no root `name`; a named WhatsApp account still gets `accounts.<id>.name`.
+
 ## [0.10.67] - 2026-10-23
 
 ### Documentation

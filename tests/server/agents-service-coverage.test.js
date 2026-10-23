@@ -713,6 +713,54 @@ describe("server/agents/service coverage", () => {
     });
   });
 
+  describe("channels domain: update (whatsapp root schema)", () => {
+    const nativeWhatsApp = () => ({
+      dmPolicy: "allowlist",
+      allowFrom: ["+15550100"],
+      selfChatMode: false,
+      groupPolicy: "disabled",
+    });
+
+    it("does not write a root-level name on a flat whatsapp config", () => {
+      const { fsMock, service } = buildService({
+        initialConfig: { channels: { whatsapp: nativeWhatsApp() } },
+      });
+
+      const result = service.updateChannelAccount({
+        provider: "whatsapp",
+        name: "Renamed",
+        agentId: "main",
+      });
+
+      expect(result.account.id).toBe("default");
+      const config = fsMock.readConfig();
+      // The strict WhatsApp plugin schema rejects `name` at the channel root.
+      expect(config.channels.whatsapp).not.toHaveProperty("name");
+      expect(config.channels.whatsapp).toEqual(nativeWhatsApp());
+    });
+
+    it("still writes the name under a named whatsapp account", () => {
+      const { fsMock, service } = buildService({
+        initialConfig: {
+          channels: {
+            whatsapp: { accounts: { work: { allowFrom: ["+15550100"] } } },
+          },
+        },
+      });
+
+      service.updateChannelAccount({
+        provider: "whatsapp",
+        accountId: "work",
+        name: "Work line",
+        agentId: "main",
+      });
+
+      const config = fsMock.readConfig();
+      expect(config.channels.whatsapp).not.toHaveProperty("name");
+      expect(config.channels.whatsapp.accounts.work.name).toBe("Work line");
+    });
+  });
+
   describe("channels domain: delete", () => {
     it("throws for unknown providers and accounts on delete", async () => {
       const empty = buildService();
