@@ -211,6 +211,20 @@ describe("server/env", () => {
     expect(fs.readFileSync(path.join(tmpDir, ".env"), "utf8")).toBe("CUSTOM_FLAG=kept");
   });
 
+  it("updateEnvFile throws on a failed read instead of rewriting .env from an empty list", () => {
+    // A directory at the .env path makes the read fail with EISDIR (a plain
+    // chmod would not stop a root process).
+    fs.mkdirSync(path.join(tmpDir, ".env"));
+    const env = loadEnvModule(tmpDir);
+    const mutator = vi.fn((current) => [...current, { key: "WATCHDOG_AUTO_REPAIR", value: "true" }]);
+
+    expect(() => env.updateEnvFile(mutator)).toThrow();
+
+    // The mutator guard is what discriminates: the write would also fail on a directory.
+    expect(mutator).not.toHaveBeenCalled();
+    expect(fs.statSync(path.join(tmpDir, ".env")).isDirectory()).toBe(true);
+  });
+
   it("clears process env vars whose file value became empty", () => {
     fs.writeFileSync(path.join(tmpDir, ".env"), "OPENAI_API_KEY=");
     const env = loadEnvModule(tmpDir);

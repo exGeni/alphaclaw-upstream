@@ -5,6 +5,21 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.68] - 2026-10-23
+
+A failed `.env` read no longer makes a save rewrite `.env` without the keys it could not read.
+
+### Fixed
+- `PUT /api/env` strips the managed channel keys (Telegram, Discord, Slack, WhatsApp) from the request and takes them, the locked keys and the hidden known keys from the file. It used the lenient `readEnvFile()`, which returns `[]` on any read error. After a failed read the route ran `channels remove --delete` for each of those channels that was enabled and then replaced `.env` with only the visible request variables, so channel tokens, locked keys and hidden known keys were lost from the file itself. The route now reads the file once, strictly (`readEnvFileStrict`): a real read failure ends in the route's existing 500 before any removal or write. A missing file still reads as empty.
+- `updateEnvFile` (the locked read-modify-write behind the Watchdog settings save) had the same shape: a failed read rewrote `.env` with only the changed keys. It now reads strictly and throws; its one caller, the Watchdog settings route, already answers such an error with 400.
+- Writing a model API key (`PUT /api/models/auth/:id`, `PUT /api/models/config`) read `.env` leniently and wrote back only the profile keys it changed. It now reads strictly and the route answers its existing 500.
+- This is the rule in `AGENTS.md` ("Every state-file reader that feeds a write fails CLOSED") applied to `.env`, which the 0.9.74 "Config wipes from fail-open reads" wave did not cover.
+
+### Tests
+- `tests/server/routes-system.test.js`: a failing strict read answers 500 with no channel sync, no write and no reload; the preserved locked, hidden and managed keys come from the strict read.
+- `tests/server/routes-models.test.js`: a failing strict read while syncing a model API key answers 500 with no `.env` write.
+- `tests/server/env.test.js`: `updateEnvFile` throws and leaves the path untouched when the read fails (EISDIR).
+
 ## [0.10.67] - 2026-10-23
 
 ### Documentation
