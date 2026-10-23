@@ -5,6 +5,17 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.63] - 2026-10-22
+
+A gateway restart no longer drops an agent's running shell command without a word: OpenClaw resumes an exec turn interrupted in the foreground, and when the restart stops a command that had already moved to the background, the owner is told once (ALPH-19).
+
+### Fixed
+- The post-relaunch wedge sweep lost the sessions it recorded at the restart request on every AlphaClaw restart. A managed cold restart notifies its launch twice per generation (the gateway's "listening" line, then `/readyz` ready), and the second notice superseded the first sweep and took an empty record (`wedge-sweep done … recorded=0` after `recorded … running=1`). A second notice for a generation that is already pending now joins that sweep, so a recorded session reaches `sessions.recover` as designed.
+
+### Added
+- The sweep tells the owner when a restart stopped background exec commands. An exec still running after its yield window (OpenClaw caps it at 120 s) moves to a background process session and the agent's turn ends. OpenClaw keeps those sessions in memory only, so a restart that stops the gateway before the command finishes loses it and its completion wake: no session is marked interrupted, nothing resumes it, and `sessions.list` shows nothing. During an AlphaClaw restart the sweep reads OpenClaw's own drain report from the gateway output (`backgroundExecSessions=N` on "draining active work before restart" and "restart drain budget … exhausted; cutting short", zeroed by "all active work drained"). After the relaunch it sends one notification ("The gateway restart stopped N command(s) the agent was running in the background … the agent was not told …"), writes one `[alphaclaw] wedge-sweep exec-stopped …` line and records one `session_wedge` `exec_stopped` event. A crash relaunch has no drain report and stays silent. Signal timing is unchanged.
+- Live test `tests/live/restart-exec-turn.e2e.test.js`, which runs against the real pinned OpenClaw with the sweep wired as in `lib/server.js`. An exec turn interrupted by each restart class (routine with the full drain, Restart now, a watchdog repair, a memory mitigation, a SIGKILL crash) is resumed by OpenClaw's restart recovery with exec still offered and finishes in the same session. `sessions.list` shows no aborted run and no tombstone, `sessions.recover` has nothing to recover, and the sweep recorded the session and stays silent. A sixth case backgrounds the exec first: the restart stops it, nothing resumes it, and the owner is told once.
+
 ## [0.10.62] - 2026-10-22
 
 Typing a `/openclaw/…` address opens the Control UI signed in on a plain-HTTP origin too, such as a VPS reached by IP (ALPH-20, found by the black-box Control UI run on a real VM).
