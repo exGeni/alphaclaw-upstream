@@ -5,6 +5,16 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.68] - 2026-10-23
+
+`alphaclaw admin DELETE ... --data` now delivers its JSON body to the server.
+
+### Fixed
+- `alphaclaw admin DELETE /api/agents/<id>/bindings --data '{...}'` and `alphaclaw admin DELETE /api/channels/accounts --data '{...}'` reached the server with an empty body, so the routes answered 400 (`Binding channel is required` for the binding, `Unsupported channel provider ""` for the account). `--data-stdin` was affected the same way; the Setup UI was not, because its `fetch` call frames the body. `lib/cli/admin.js` wrote the body but set no `Content-Length`; Node's `ClientRequest` chunk-encodes only methods that normally carry a body, so a DELETE body (and a GET, HEAD or OPTIONS body) went out unframed and the server read `{}`. Every body is now framed with `Content-Length` (byte length, so multibyte JSON is right). POST and PUT bodies now carry `Content-Length` instead of chunked encoding; a request without a body still sends no `Content-Length`.
+
+### Tests
+- `tests/bin/admin-cli.test.js`: a DELETE body arrives with its `Content-Length`, a multibyte body is framed by bytes, a POST body is intact, and a GET without a body sends no `Content-Length`.
+
 ## [0.10.67] - 2026-10-23
 
 ### Documentation
