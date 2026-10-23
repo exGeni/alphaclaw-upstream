@@ -5,6 +5,19 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.68] - 2026-10-23
+
+`agents.update` keeps the per-agent tool settings it does not manage, and can set a per-agent `allow` list and `fs.workspaceOnly`.
+
+### Fixed
+- Saving `tools` through `PUT /api/agents/:id` (the `agents.update` admin op, and the Setup UI tools save) rebuilt the agent's `tools` object from `profile`, `alsoAllow` and `deny` only, so every other per-agent key (`allow`, `fs`, `elevated`, `exec`, `byProvider`, ...) was removed by the next save. Those keys are now kept. `profile`, `alsoAllow` and `deny` are still replaced together.
+
+### Added
+- `agents.update` accepts `tools.allow` (a strict, non-empty allowlist; it cannot be combined with a non-empty `alsoAllow`, which OpenClaw's config validation rejects in the same scope) and `tools.fs.workspaceOnly` (`true`, `false` or `null`, patched field by field). An omitted `allow` is kept; `allow: null` removes it. A patch that sets a non-empty `alsoAllow` while a strict `allow` is stored is rejected with 400 (send `allow: null` to replace it), so a save cannot silently widen an agent.
+
+### Changed
+- Stricter `tools` validation on `agents.update`: unknown keys, an unknown `profile`, a non-boolean `fs.workspaceOnly`, `tools` as an array, non-string or whitespace tool names and lists over 500 entries return 400 (before: ignored, stored `{}` or coerced with `String()`). An own `alsoAllow: []` is now stored (before: dropped); it overrides `tools.alsoAllow` for that agent.
+
 ## [0.10.67] - 2026-10-23
 
 ### Documentation
