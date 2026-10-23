@@ -5,6 +5,18 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.68] - 2026-10-23
+
+A Telegram forum topic can only route to an agent that exists. The topic routes and the CLI refuse unknown or malformed agent ids, deleting an agent unroutes its topics, and the topic sync no longer writes a route to an unknown agent.
+
+### Fixed
+- `POST`/`PUT /api/telegram/groups/:groupId/topics…`, `…/topics/bulk` and `alphaclaw telegram topic add|create --agent` took `agentId` as given. An unknown id was written to the topic registry and to `channels.telegram.groups.<id>.topics.<thread>.agentId`, and OpenClaw's config validation accepts it. Now an id that is not an agent-id slug (`isValidAgentId`) or names no configured agent is refused before any Telegram call or state write: HTTP 400, CLI exit 1. In bulk, that row fails and the rest still land. An empty id still clears the route. The slug check is stricter than OpenClaw's own id grammar (underscores, upper case) on purpose.
+- `agents.delete` left the deleted agent's id on its Telegram topics, in the topic registry and in `openclaw.json`, and the next topic sync wrote it back. It now clears both (registry first, idempotent; `openclaw.json` in the same write that removes the agent), puts the registry routes back if that write fails, and returns the unrouted topics as `unroutedTopics`. A corrupt registry or config refuses the delete with a 503 (the route answered 400 before).
+- `syncConfigForTelegram` no longer writes the route of a registry topic whose agent is not configured. The topic keeps its prompt. The decision is made under the config lock, so an agent deleted while Telegram is answering cannot get a route into `openclaw.json`; a registry entry written during the delete can keep the id until the next sync. The skipped routes are logged and returned as `danglingAgentTopics`.
+
+### Tests
+- Routes: unknown, malformed and empty ids on create, bulk and update; unparseable config answers 503. CLI: `--agent` refused. `agents.delete`: registry and config cleared, rollback, fail-closed. Sync: dangling route dropped, prompt kept.
+
 ## [0.10.67] - 2026-10-23
 
 ### Documentation
