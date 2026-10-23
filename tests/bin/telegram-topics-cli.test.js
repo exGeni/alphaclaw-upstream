@@ -171,8 +171,41 @@ describe("bin/alphaclaw telegram topic commands", () => {
       expect(cfg.channels.telegram.accounts).toBeUndefined();
     });
 
+    it("refuses an unknown --agent", () => {
+      writeConfig({
+        agents: { list: [{ id: "main" }] },
+        channels: {
+          telegram: {
+            enabled: true,
+            groups: { "-100123": { topics: { "39": { agentId: "main", systemPrompt: "config only" } } } },
+          },
+        },
+      });
+      const refused = runCli([
+        "telegram", "topic", "add", "--thread", "12", "--name", "Ops", "--agent", "ghost",
+      ]);
+      expect(refused.status).toBe(1);
+      expect(refused.stderr).toContain('Unknown agent "ghost"');
+      expect(fs.existsSync(registryPath())).toBe(false);
+
+      const mapped = runCli(["telegram", "topic", "add", "--thread", "12", "--name", "Ops", "--agent", "main"]);
+      expect(mapped.status).toBe(0);
+    });
+
+    it("refuses a non-slug --agent even when it normalizes to a configured agent", () => {
+      writeConfig({ ...kTopLevelConfig, agents: { list: [{ id: "main" }, { id: "foo-bar" }] } });
+      for (const raw of ["MAIN", "foo!!!bar"]) {
+        const refused = runCli([
+          "telegram", "topic", "add", "--thread", "12", "--name", "Ops", "--agent", raw,
+        ]);
+        expect(refused.status).toBe(1);
+        expect(refused.stderr).toContain("Invalid agent id");
+      }
+      expect(fs.existsSync(registryPath())).toBe(false);
+    });
+
     it("resolves accounts.*.groups and passes the accountId through to config sync", () => {
-      writeConfig(kAccountsConfig);
+      writeConfig({ ...kAccountsConfig, agents: { list: [{ id: "main" }, { id: "qa" }] } });
       const result = runCli([
         "telegram", "topic", "add", "--thread", "9", "--name", "QA", "--agent", "qa",
       ]);
@@ -295,7 +328,7 @@ describe("bin/alphaclaw telegram topic commands", () => {
       JSON.parse(fs.readFileSync(fetchCapturePath(), "utf8"));
 
     it("creates the forum topic, registers it, and syncs config + prompts", () => {
-      writeConfig(kTopLevelConfig);
+      writeConfig({ ...kTopLevelConfig, agents: { list: [{ id: "main" }, { id: "ops" }] } });
       const result = runCli(
         [
           "telegram", "topic", "create",
