@@ -5,6 +5,19 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.68] - 2026-10-23
+
+Env sync no longer deletes a WhatsApp channel that AlphaClaw did not derive from `WHATSAPP_OWNER_NUMBER`.
+
+### Fixed
+- `syncChannelConfig` ran `openclaw channels remove --channel whatsapp --delete` on every boot and every env save whenever `channels.whatsapp.enabled` was true and `WHATSAPP_OWNER_NUMBER` was not set. That removed a WhatsApp channel configured outside AlphaClaw (OpenClaw's own setup: literal `allowFrom` numbers, peer bindings, no owner-number variable). `kChannelDefs.whatsapp` already declared `sync: false`, but nothing read the flag (`TODOS.md`, v0.9.49 deferrals, item 5). The removal now honors it: a `sync: false` channel is removed only when its config references the env key (`${WHATSAPP_OWNER_NUMBER}` or a per-account `${WHATSAPP_OWNER_NUMBER_<SUFFIX>}`) and none of the keys it references has a value, so a named account whose own key is set stays. The add path and the removal of every other channel are unchanged.
+
+### Changed
+- Behavior change: the WhatsApp config that fresh onboarding writes (`applyFreshOnboardingChannels` in `lib/server/onboarding/openclaw.js`, the owner number stored literally in `allowFrom`) no longer counts as derived from the env key, so clearing `WHATSAPP_OWNER_NUMBER` does not delete it. Remove the channel with `openclaw channels remove --channel whatsapp --delete` or the channel delete action. A config that references `${WHATSAPP_OWNER_NUMBER}` still goes with the variable.
+
+### Tests
+- `tests/server/gateway.test.js`: the test that pinned the old removal (`{ whatsapp: { enabled: true } }` is removed) is replaced by cases for an env-referencing config (removed), a per-account reference (removed), a native config in modes `remove` and `all` (untouched), a native config with peer bindings and no `enabled` key (byte-identical), a named account whose own key is set (kept), the literal-number onboarding shape (untouched), other channels still syncing, and a native config with the owner number present (untouched).
+
 ## [0.10.67] - 2026-10-23
 
 ### Documentation
