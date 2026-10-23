@@ -448,6 +448,26 @@ describe("server/routes/models", () => {
     expect(deps.reloadEnv).toHaveBeenCalledTimes(1);
   });
 
+  it("does not write .env when the strict read fails while syncing a model API key", async () => {
+    const deps = createModelDeps();
+    deps.readEnvFile.mockReturnValue([]);
+    deps.readEnvFileStrict = vi.fn(() => {
+      throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+    });
+    deps.authProfiles.getEnvVarForApiKeyProvider.mockReturnValue("OPENAI_API_KEY");
+    const app = createApp(deps);
+
+    const res = await request(app).put("/api/models/auth/openai:default").send({
+      type: "api_key",
+      provider: "openai",
+      key: "sk-live-123",
+    });
+
+    expect(res.status).toBe(500);
+    expect(deps.writeEnvFile).not.toHaveBeenCalled();
+    expect(deps.reloadEnv).not.toHaveBeenCalled();
+  });
+
   it("removes API-key env vars when profile key is cleared", async () => {
     const deps = createModelDeps();
     deps.shellCmd.mockResolvedValue("");

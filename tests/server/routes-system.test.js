@@ -264,6 +264,49 @@ describe("server/routes/system", () => {
     expect(deps.restartGateway).not.toHaveBeenCalled();
   });
 
+  it("answers 500 and neither removes channels nor rewrites .env when the strict .env read fails on PUT /api/env", async () => {
+    const deps = createSystemDeps();
+    deps.readEnvFile.mockReturnValue([]);
+    deps.readEnvFileStrict = vi.fn(() => {
+      throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+    });
+    const app = createApp(deps);
+
+    const res = await request(app)
+      .put("/api/env")
+      .send({ vars: [{ key: "OPENAI_API_KEY", value: "abc" }] });
+
+    expect(res.status).toBe(500);
+    expect(res.body.ok).toBe(false);
+    expect(res.body.error).toContain("EIO");
+    expect(deps.syncChannelConfig).not.toHaveBeenCalled();
+    expect(deps.writeEnvFile).not.toHaveBeenCalled();
+    expect(deps.reloadEnv).not.toHaveBeenCalled();
+  });
+
+  it("takes the preserved managed, locked and hidden keys from the strict read on PUT /api/env", async () => {
+    const deps = createSystemDeps();
+    deps.readEnvFile.mockReturnValue([]);
+    deps.readEnvFileStrict = vi.fn(() => [
+      { key: "TELEGRAM_BOT_TOKEN", value: "tg-file-value" },
+      { key: "ANTHROPIC_TOKEN", value: "hidden-file-value" },
+      { key: "GITHUB_WORKSPACE_REPO", value: "owner/repo" },
+    ]);
+    const app = createApp(deps);
+
+    const res = await request(app)
+      .put("/api/env")
+      .send({ vars: [{ key: "OPENAI_API_KEY", value: "abc" }] });
+
+    expect(res.status).toBe(200);
+    expect(deps.writeEnvFile).toHaveBeenCalledWith([
+      { key: "OPENAI_API_KEY", value: "abc" },
+      { key: "ANTHROPIC_TOKEN", value: "hidden-file-value" },
+      { key: "TELEGRAM_BOT_TOKEN", value: "tg-file-value" },
+      { key: "GITHUB_WORKSPACE_REPO", value: "owner/repo" },
+    ]);
+  });
+
   it.each([
     "ALPHACLAW_ALLOW_LEGACY_LOGIN",
     "ALPHACLAW_SETUP_URL",
