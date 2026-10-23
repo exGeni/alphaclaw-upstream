@@ -5,6 +5,16 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.68] - 2026-10-23
+
+The boot channel sync no longer removes every managed channel when `.env` cannot be read.
+
+### Fixed
+- `readEnvFile()` returns `[]` on any read error (`EACCES`, `EIO`, a transient failure). The boot channel sync (`syncChannelConfig(readEnvFile())`) then saw no bot tokens and ran `openclaw channels remove --channel <name> --delete` for every enabled managed channel (Telegram, Discord, Slack, WhatsApp, ClickClack). This needs a read that fails after the process's own early `.env` load: a transient error in the boot window, or a failure present at Retry upgrade or the onboarding-completion run. The boot and the Retry upgrade convergence now read the file with `readEnvFileStrict`: a real read failure throws, the existing `try/catch` logs "channel sync failed" and skips the sync, and the gateway launches on its prior channel config (channels whose token is missing from the gateway env stay down, but nothing is deleted). A missing file still reads as empty.
+
+### Tests
+- `tests/server/startup.test.js`: a throwing env read skips the channel sync, logs it, and still launches the gateway.
+
 ## [0.10.67] - 2026-10-23
 
 ### Documentation
