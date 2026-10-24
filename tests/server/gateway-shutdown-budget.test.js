@@ -72,3 +72,23 @@ describe("shutdown deadline wiring (lib/server.js)", () => {
     expect(source).toContain("drainDeadlineMs: constants.kProcessShutdownDeadlineMs");
   });
 });
+
+describe("shutdown ladder split (gateway.js shutdownLadderGraces)", () => {
+  const { shutdownLadderGraces } = require("../../lib/server/gateway");
+  it("keeps upstream's 3.6 s / 1.8 s split for the 6 s default", () => {
+    expect(shutdownLadderGraces(6_000)).toEqual({ termGraceMs: 3_600, killGraceMs: 1_800 });
+  });
+  it("gives a long budget to SIGTERM so OpenClaw's 325 s stop budget fits before any SIGKILL", () => {
+    const { termGraceMs, killGraceMs } = shutdownLadderGraces(335_000);
+    expect(killGraceMs).toBe(5_000);
+    expect(termGraceMs).toBe(329_000);
+    expect(termGraceMs).toBeGreaterThanOrEqual(325_000);
+  });
+  it("never lets the stages outrun the budget and keeps the old floors", () => {
+    for (const budgetMs of [1_000, 6_000, 20_000, 335_000, 900_000]) {
+      const { termGraceMs, killGraceMs } = shutdownLadderGraces(budgetMs);
+      expect(termGraceMs + killGraceMs).toBeLessThanOrEqual(Math.max(budgetMs, 1_500));
+    }
+    expect(shutdownLadderGraces(1_000)).toEqual({ termGraceMs: 1_000, killGraceMs: 500 });
+  });
+});
