@@ -10,6 +10,7 @@ const {
   readRetryEligibility,
   snapshotDismissKey,
 } = require("../../lib/server/openclaw-upgrade-status");
+const { evaluateUpgradeDiskCheck } = require("../../lib/server/upgrade-disk-check");
 
 const kPin = "2026.10.4";
 const key = { openclawVersion: kPin, alphaclawVersion: "0.10.7", configSha: "abc", layout: { symlinked: true } };
@@ -183,5 +184,78 @@ describe("openclaw-upgrade-status: retry eligibility", () => {
     expect(readRetryEligibility({ record, installedVersion: kPin, currentKey: key })).toMatchObject({ ok: false, code: "unchanged_since_failure", unchangedSince: 3 });
     expect(readRetryEligibility({ record, installedVersion: kPin, currentKey: key, confirmUnchanged: true })).toEqual({ ok: true, unchanged: true });
     expect(readRetryEligibility({ record, installedVersion: kPin, currentKey: { ...key, configSha: "x" } })).toEqual({ ok: true, unchanged: false });
+  });
+});
+
+describe("openclaw-upgrade-status: disk space row (ALPH-23)", () => {
+  const warn = { verdict: "warn", sentences: ["Only 45.0 GB is free for 30.0 GB of OpenClaw state."], stateBytes: 30e9, freeBytes: 45e9, expectedMinutes: 24 };
+  const refuse = { verdict: "refuse", sentences: ["Make at least 60.0 GB free, then use Retry upgrade."], stateBytes: 30e9, freeBytes: 30e9, expectedMinutes: 24 };
+  const completed = { completedForVersion: kPin };
+
+  it("warns admins before the next upgrade, dismissible, and gives Retry upgrade the same sentences", () => {
+    const status = buildUpgradeStatus({ record: completed, installedVersion: kPin, diskCheck: warn, isAdmin: true });
+    expect(status.alert).toMatchObject({
+      kind: "disk_space",
+      tone: "warning",
+      badgeLabel: "At risk",
+      headline: "OpenClaw's next data upgrade is at risk",
+      sentence: warn.sentences[0],
+      actions: ["dismiss"],
+    });
+    expect(status.retry.disk).toEqual({ verdict: "warn", sentences: warn.sentences, expectedMinutes: 24 });
+    const dismissed = buildUpgradeStatus({ record: completed, installedVersion: kPin, diskCheck: warn, isAdmin: true, dismissed: [status.alert.dismissKey] });
+    expect(dismissed.alert).toBeNull();
+  });
+
+  it("a refusal is an error and cannot be dismissed", () => {
+    const status = buildUpgradeStatus({ record: completed, installedVersion: kPin, diskCheck: refuse, isAdmin: true });
+    expect(status.alert).toMatchObject({ kind: "disk_space", tone: "error", headline: "OpenClaw's next data upgrade can't start", actions: [], dismissKey: null });
+  });
+
+  it("never covers a failure row, and members never see it", () => {
+    const failure = buildUpgradeStatus({ record: { lastOutcome: failed() }, installedVersion: kPin, diskCheck: refuse, isAdmin: true });
+    expect(failure.alert.kind).toBe("failed");
+    expect(buildUpgradeStatus({ record: completed, installedVersion: kPin, diskCheck: warn, isAdmin: false }).alert).toBeNull();
+  });
+
+  it("a boot that refused for disk space says the upgrade didn't start, with AlphaClaw's sentence", () => {
+    const status = buildUpgradeStatus({
+      record: { lastOutcome: failed({ class: "transient", reason: "insufficient_disk", detail: refuse.sentences[0], captureState: "unknown" }) },
+      installedVersion: kPin,
+      isAdmin: true,
+    });
+    expect(status.alert).toMatchObject({
+      kind: "interrupted",
+      headline: "OpenClaw's data upgrade didn't start",
+      sentence: expect.stringContaining(refuse.sentences[0]),
+      detail: null,
+      actions: expect.arrayContaining(["retry_upgrade"]),
+    });
+  });
+
+  it("a disk refusal reads the volume as it is now, except while a Doctor is writing to it", () => {
+    const record = { lastOutcome: failed({ class: "transient", reason: "insufficient_disk", detail: "recorded sentence", captureState: "unknown" }) };
+    const tight = evaluateUpgradeDiskCheck({ stateBytes: 4.2e9, freeBytes: 3.0e9 });
+    const stillTight = buildUpgradeStatus({ record, installedVersion: kPin, diskCheck: tight, isAdmin: true });
+    expect(stillTight.alert.sentence).toContain("3.0 GB free for 4.2 GB");
+    expect(stillTight.alert.sentence).not.toContain("recorded sentence");
+
+    const roomy = evaluateUpgradeDiskCheck({ stateBytes: 4.2e9, freeBytes: 6.0e9 });
+    const freed = buildUpgradeStatus({ record, installedVersion: kPin, diskCheck: roomy, isAdmin: true });
+    expect(freed.alert.sentence).toMatch(/^There is room for it to start now. Use Retry upgrade. Only 6.0 GB is free for 4.2 GB/);
+    expect(freed.alert.sentence).toContain("skip its recovery copy");
+
+    const plenty = evaluateUpgradeDiskCheck({ stateBytes: 4.2e9, freeBytes: 20e9 });
+    expect(buildUpgradeStatus({ record, installedVersion: kPin, diskCheck: plenty, isAdmin: true }).alert.sentence).toMatch(
+      /^There is room for it now: 20.0 GB free for 4.2 GB of OpenClaw state. Use Retry upgrade./,
+    );
+
+    const busy = { kind: "upgrade_retry", label: "Retry upgrade" };
+    const running = buildUpgradeStatus({ record, installedVersion: kPin, diskCheck: tight, busy, isAdmin: true });
+    expect(running.alert.sentence).toContain("recorded sentence");
+    expect(buildUpgradeStatus({ record: completed, installedVersion: kPin, diskCheck: refuse, busy, isAdmin: true }).alert).toBeNull();
+
+    const unmeasured = evaluateUpgradeDiskCheck({ stateBytes: 4.2e9, freeBytes: null });
+    expect(buildUpgradeStatus({ record, installedVersion: kPin, diskCheck: unmeasured, isAdmin: true }).alert.sentence).toContain("recorded sentence");
   });
 });
