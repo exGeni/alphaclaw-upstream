@@ -44,6 +44,7 @@ const createService = ({
   fsImpl = fs,
   drain,
   markExiting,
+  drainDeadlineMs,
 } = {}) => {
   const { createAlphaclawVersionService } = loadVersionModule({ execMock, execFileMock });
   const service = createAlphaclawVersionService({
@@ -56,6 +57,7 @@ const createService = ({
     }),
     ...(drain ? { drain } : {}),
     ...(markExiting ? { markExiting } : {}),
+    ...(drainDeadlineMs ? { drainDeadlineMs } : {}),
   });
   return { service, fetchMock, execMock, execFileMock };
 };
@@ -1000,6 +1002,28 @@ describe("server/alphaclaw-version", () => {
     await expect(service.restartProcess()).rejects.toThrow("exit 75");
     expect(drain).toHaveBeenCalledTimes(1);
     expect(exitSpy).toHaveBeenCalledWith(75);
+  });
+
+  it("bounds a drain that never settles by drainDeadlineMs (the process shutdown deadline)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.spyOn(process, "exit").mockImplementation((code) => {
+        throw new Error(`exit ${code}`);
+      });
+      const drain = vi.fn(() => new Promise(() => {}));
+      const { service } = createService({ env: { RENDER: "true" }, drain, drainDeadlineMs: 339000 });
+      let settled = false;
+      const outcome = service.restartProcess().catch((error) => {
+        settled = true;
+        return error;
+      });
+      await vi.advanceTimersByTimeAsync(338000);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect((await outcome).message).toBe("exit 75");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("latches the lifecycle exiting state before draining", async () => {
