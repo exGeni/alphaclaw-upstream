@@ -1,6 +1,8 @@
 // Shutdown stop budget: ALPHACLAW_GATEWAY_SHUTDOWN_STOP_TIMEOUT, default 6 s
 // (process deadline 10 s, upstream's fixed values), clamped 6..900, deployment
 // env only, read at module load. The process deadline is the budget + 4 s.
+const { readFileSync } = require("node:fs");
+const path = require("node:path");
 const { kDeploymentOnlyEnvKeys } = require("../../lib/server/deployment-only-env");
 
 const kConstantsPath = require.resolve("../../lib/server/constants");
@@ -39,7 +41,34 @@ describe("shutdown stop budget", () => {
     ]);
   });
 
+  it("treats empty and whitespace as unset and honours the bounds silently", () => {
+    expect(loadBudgets("")).toEqual([6_000, 10_000]);
+    expect(loadBudgets("  ")).toEqual([6_000, 10_000]);
+    expect(loadBudgets(" 335 ")).toEqual([335_000, 339_000]);
+    expect(loadBudgets("6")).toEqual([6_000, 10_000]);
+    expect(loadBudgets("900")).toEqual([900_000, 904_000]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("warns when a written value is normalized", () => {
+    expect(loadBudgets("335s")).toEqual([335_000, 339_000]);
+    expect(warn.mock.calls.map(([line]) => line)).toEqual([
+      "[alphaclaw] ALPHACLAW_GATEWAY_SHUTDOWN_STOP_TIMEOUT=335s normalized to 335s (valid range 6-900)",
+    ]);
+  });
+
   it("is deployment env only", () => {
     expect(kDeploymentOnlyEnvKeys).toContain("ALPHACLAW_GATEWAY_SHUTDOWN_STOP_TIMEOUT");
+  });
+});
+
+// server.js is not unit-loadable; without these two lines the lifecycle and the
+// self-update drain fall back to their fixed 10 s defaults and the gateway is
+// SIGKILLed mid-shutdown again whatever the env says.
+describe("shutdown deadline wiring (lib/server.js)", () => {
+  const source = readFileSync(path.join(__dirname, "..", "..", "lib", "server.js"), "utf8");
+  it("passes the derived deadline to the lifecycle and to the self-update drain", () => {
+    expect(source).toContain("shutdownDeadlineMs: constants.kProcessShutdownDeadlineMs");
+    expect(source).toContain("drainDeadlineMs: constants.kProcessShutdownDeadlineMs");
   });
 });
