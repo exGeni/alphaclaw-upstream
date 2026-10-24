@@ -5,6 +5,20 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.57-exgenius.2] - 2026-10-24
+
+### Fixed
+
+- A container stop no longer SIGKILLs the gateway after ~4 s when the host
+  gives it longer. `ALPHACLAW_GATEWAY_SHUTDOWN_STOP_TIMEOUT` (seconds, default
+  `6`, clamped `6`–`900`, deployment env only) sets the gateway stop budget of
+  AlphaClaw's own shutdown (`stopGatewayForShutdown`, SIGTERM 60% / SIGKILL
+  30% as before); the process shutdown deadline and the self-update drain race
+  are that budget + 4 s. Unset, the values stay upstream's 6 s / 10 s. Before,
+  both were fixed, so on a host with a 360 s `stop_grace_period` a SIGTERMed
+  gateway was SIGKILLed after ~4 s and every agent database lost its clean-close
+  receipt; the next boot then revalidated them all at once and refused agents.
+
 ## [0.10.57-exgenius.1] - 2026-10-22
 
 exGeni fork line rebuilt on upstream **v0.10.57** (`garrytan/alphaclaw` main
