@@ -330,7 +330,7 @@ describe("server/agents/service coverage", () => {
       expect(updated.identity).toEqual({ role: "helper", name: "Renamed" });
     });
 
-    it("clears tools config for non-object tools patches", async () => {
+    it("clears tools config with tools: null; {} keeps an empty tools object", async () => {
       const { fsMock, service } = buildService({
         initialConfig: {
           agents: {
@@ -349,6 +349,336 @@ describe("server/agents/service coverage", () => {
 
       const emptied = await service.updateAgent("tooly", { tools: {} });
       expect(emptied.tools).toEqual({});
+    });
+
+    describe("deleteAgent unroutes the agent's Telegram topics (0.9.95-exgenius.7)", () => {
+      const build = (registry) => {
+        const fsMock = buildFsMock({
+          initialConfig: {
+            agents: { list: [{ id: "main", default: true }, { id: "dispatcher" }] },
+            channels: {
+              telegram: {
+                groups: {
+                  "-100": {
+                    topics: {
+                      "16": { agentId: "dispatcher" },
+                      "17": { agentId: "Dispatcher", systemPrompt: "keep me" },
+                      "39": { agentId: "main" },
+                    },
+                  },
+                },
+                accounts: {
+                  work: { groups: { "-200": { topics: { "5": { agentId: "dispatcher" } } } } },
+                },
+              },
+            },
+          },
+        });
+        const service = createAgentsService({ fs: fsMock, OPENCLAW_DIR, topicRegistry: registry });
+        return { fsMock, service };
+      };
+
+      it("clears topic agentId in openclaw.json and in the registry, and reports both", () => {
+        const registry = {
+          clearAgentReferences: vi.fn(() => [{ groupId: "-100", threadId: "16" }]),
+        };
+        const { fsMock, service } = build(registry);
+        const result = service.deleteAgent("dispatcher");
+        const telegram = fsMock.readConfig().channels.telegram;
+        expect(telegram.groups["-100"].topics).toEqual({
+          "17": { systemPrompt: "keep me" },
+          "39": { agentId: "main" },
+        });
+        expect(telegram.accounts.work.groups["-200"]).not.toHaveProperty("topics");
+        expect(registry.clearAgentReferences).toHaveBeenCalledWith("dispatcher", { source: "agent-delete" });
+        expect(result).toEqual({
+          ok: true,
+          unroutedTopics: {
+            config: [
+              { groupId: "-100", threadId: "16" },
+              { groupId: "-100", threadId: "17" },
+              { accountId: "work", groupId: "-200", threadId: "5" },
+            ],
+            registry: [{ groupId: "-100", threadId: "16" }],
+          },
+        });
+      });
+
+      it("puts the registry routes back when the config write fails (codex)", () => {
+        const registry = {
+          clearAgentReferences: vi.fn(() => [{ groupId: "-100", threadId: "16", agentId: "dispatcher" }]),
+          updateTopic: vi.fn(),
+        };
+        const { fsMock, service } = build(registry);
+        fsMock.writeFileSync.mockImplementation(() => {
+          throw new Error("disk full");
+        });
+        expect(() => service.deleteAgent("dispatcher")).toThrow();
+        expect(registry.updateTopic).toHaveBeenCalledWith("-100", "16", { agentId: "dispatcher" }, {
+          source: "agent-delete-rollback",
+        });
+      });
+
+      it("names registry routes it could not restore after a failed config write (codex)", () => {
+        const registry = {
+          clearAgentReferences: vi.fn(() => [{ groupId: "-100", threadId: "16", agentId: "dispatcher" }]),
+          updateTopic: vi.fn(() => {
+            throw new Error("lock timeout");
+          }),
+        };
+        const { fsMock, service } = build(registry);
+        fsMock.writeFileSync.mockImplementation(() => {
+          throw new Error("disk full");
+        });
+        expect(() => service.deleteAgent("dispatcher")).toThrow("NOT restored (re-add with a topic PUT): -100/16->dispatcher");
+      });
+
+      it("refuses the delete (openclaw.json untouched, retryable) when the registry clear fails", () => {
+        const registry = {
+          clearAgentReferences: vi.fn(() => {
+            throw new Error("Refusing to touch topic-registry.json: file exists but is not valid JSON");
+          }),
+        };
+        const { fsMock, service } = build(registry);
+        expect(() => service.deleteAgent("dispatcher")).toThrow("not valid JSON");
+        const cfg = fsMock.readConfig();
+        expect(cfg.agents.list.map((a) => a.id)).toContain("dispatcher");
+        expect(cfg.channels.telegram.groups["-100"].topics["16"]).toEqual({ agentId: "dispatcher" });
+      });
+    });
+
+    describe("per-agent tools (profile / allow / alsoAllow / deny / fs)", () => {
+      const buildToolsService = (receptionTools) =>
+        buildService({
+          initialConfig: {
+            agents: {
+              list: [
+                { id: "main", default: true },
+                { id: "reception", ...(receptionTools ? { tools: receptionTools } : {}) },
+              ],
+            },
+          },
+        });
+      const savedTools = (fsMock) =>
+        fsMock.readConfig().agents.list.find((a) => a.id === "reception").tools;
+
+      it("keeps per-agent tools keys AlphaClaw does not manage, and fs when omitted", async () => {
+        const { fsMock, service } = buildToolsService({
+          profile: "coding",
+          deny: ["exec"],
+          elevated: { enabled: false },
+          exec: { security: "deny" },
+          fs: { workspaceOnly: true },
+        });
+        await service.updateAgent("reception", { tools: { profile: "messaging", deny: ["exec", "write"] } });
+        expect(savedTools(fsMock)).toEqual({
+          profile: "messaging",
+          deny: ["exec", "write"],
+          elevated: { enabled: false },
+          exec: { security: "deny" },
+          fs: { workspaceOnly: true },
+        });
+      });
+
+      it("sets a strict allow list and refuses allow together with alsoAllow, or an empty allow", async () => {
+        const { fsMock, service } = buildToolsService({ profile: "messaging" });
+        await service.updateAgent("reception", {
+          tools: { profile: "messaging", allow: [" message ", "message", "sessions_list"] },
+        });
+        expect(savedTools(fsMock)).toEqual({ profile: "messaging", allow: ["message", "sessions_list"] });
+        await expect(
+          service.updateAgent("reception", { tools: { allow: ["read"], alsoAllow: ["exec"] } }),
+        ).rejects.toThrow("cannot set both allow and alsoAllow");
+        await expect(service.updateAgent("reception", { tools: { allow: [] } })).rejects.toThrow(
+          "must name at least one tool",
+        );
+        expect(savedTools(fsMock)).toEqual({ profile: "messaging", allow: ["message", "sessions_list"] });
+      });
+
+      it("keeps an allow list the patch omits (Setup UI shape); allow: null or a new alsoAllow replaces it (refuter)", async () => {
+        const { fsMock, service } = buildToolsService({ profile: "messaging", allow: ["message"] });
+        await service.updateAgent("reception", { tools: { profile: "messaging", deny: ["exec"] } });
+        expect(savedTools(fsMock)).toEqual({ profile: "messaging", allow: ["message"], deny: ["exec"] });
+        await service.updateAgent("reception", { tools: { profile: "minimal", alsoAllow: ["read"] } });
+        expect(savedTools(fsMock)).toEqual({ profile: "minimal", alsoAllow: ["read"] });
+        await service.updateAgent("reception", { tools: { profile: "messaging", allow: ["message"] } });
+        await service.updateAgent("reception", { tools: { profile: "messaging", alsoAllow: [] } });
+        // A supplied [] replaces allow and is kept as an own override of tools.alsoAllow (codex).
+        expect(savedTools(fsMock)).toEqual({ profile: "messaging", alsoAllow: [] });
+        await service.updateAgent("reception", { tools: { profile: "messaging", allow: ["message"] } });
+        await service.updateAgent("reception", { tools: { profile: "messaging", allow: null } });
+        expect(savedTools(fsMock)).toEqual({ profile: "messaging" });
+      });
+
+      it("patches fs.workspaceOnly field by field; fs: null removes it", async () => {
+        const { fsMock, service } = buildToolsService({ profile: "messaging" });
+        await service.updateAgent("reception", { tools: { profile: "messaging", fs: { workspaceOnly: true } } });
+        expect(savedTools(fsMock).fs).toEqual({ workspaceOnly: true });
+        await service.updateAgent("reception", { tools: { profile: "messaging", fs: { workspaceOnly: null } } });
+        expect(savedTools(fsMock)).not.toHaveProperty("fs");
+        await service.updateAgent("reception", { tools: { profile: "messaging", fs: { workspaceOnly: false } } });
+        expect(savedTools(fsMock).fs).toEqual({ workspaceOnly: false });
+        await service.updateAgent("reception", { tools: { profile: "messaging", fs: null } });
+        expect(savedTools(fsMock)).not.toHaveProperty("fs");
+      });
+
+      it("rejects unknown keys, unknown profiles and non-object tools without writing", async () => {
+        const { fsMock, service } = buildToolsService({ profile: "messaging", deny: ["exec"] });
+        await expect(service.updateAgent("reception", { tools: { profile: "bogus" } })).rejects.toThrow(
+          "tools.profile must be one of",
+        );
+        await expect(service.updateAgent("reception", { tools: { elevated: {} } })).rejects.toThrow(
+          "unsupported keys: elevated",
+        );
+        await expect(service.updateAgent("reception", { tools: "none" })).rejects.toThrow(
+          "tools must be an object",
+        );
+        await expect(
+          service.updateAgent("reception", { tools: { fs: { workspaceOnly: "yes" } } }),
+        ).rejects.toThrow("workspaceOnly must be true, false or null");
+        expect(savedTools(fsMock)).toEqual({ profile: "messaging", deny: ["exec"] });
+      });
+    });
+
+    describe("per-agent models (agentRuntime / params / codeMode)", () => {
+      const buildModelsService = (receptionModels) =>
+        buildService({
+          initialConfig: {
+            agents: {
+              defaults: {
+                models: { "anthropic/claude-sonnet-5-5": { agentRuntime: { id: "claude-cli" } } },
+              },
+              list: [
+                { id: "main", default: true },
+                { id: "reception", ...(receptionModels ? { models: receptionModels } : {}) },
+              ],
+            },
+          },
+        });
+
+      it("sets one agent's runtime without touching agents.defaults", async () => {
+        const { fsMock, service } = buildModelsService();
+        const updated = await service.updateAgent("reception", {
+          models: { "anthropic/claude-sonnet-5-5": { agentRuntime: { id: "openclaw" } } },
+        });
+        expect(updated.models).toEqual({
+          "anthropic/claude-sonnet-5-5": { agentRuntime: { id: "openclaw" } },
+        });
+        const saved = fsMock.readConfig().agents;
+        expect(saved.defaults.models).toEqual({
+          "anthropic/claude-sonnet-5-5": { agentRuntime: { id: "claude-cli" } },
+        });
+        expect(saved.list.find((a) => a.id === "main")).not.toHaveProperty("models");
+      });
+
+      it("merges by model id, removes with null and clears with models: null", async () => {
+        const { fsMock, service } = buildModelsService({
+          "openai/gpt-5.6-luna": { agentRuntime: { id: "openclaw" } },
+        });
+        await service.updateAgent("reception", {
+          models: { "anthropic/claude-sonnet-5-5": { agentRuntime: { id: "openclaw" }, codeMode: false } },
+        });
+        let reception = fsMock.readConfig().agents.list.find((a) => a.id === "reception");
+        expect(Object.keys(reception.models)).toEqual([
+          "openai/gpt-5.6-luna",
+          "anthropic/claude-sonnet-5-5",
+        ]);
+        await service.updateAgent("reception", { models: { "openai/gpt-5.6-luna": null } });
+        reception = fsMock.readConfig().agents.list.find((a) => a.id === "reception");
+        expect(Object.keys(reception.models)).toEqual(["anthropic/claude-sonnet-5-5"]);
+        await service.updateAgent("reception", { models: null });
+        reception = fsMock.readConfig().agents.list.find((a) => a.id === "reception");
+        expect(reception).not.toHaveProperty("models");
+      });
+
+      it("patches an entry field by field, keeping the runtime and keys it does not edit", async () => {
+        const { fsMock, service } = buildModelsService({
+          "anthropic/claude-sonnet-5-5": {
+            agentRuntime: { id: "openclaw" },
+            alias: "sonnet",
+            streaming: false,
+            params: { temperature: 0.2 },
+          },
+        });
+        await service.updateAgent("reception", {
+          models: { "anthropic/claude-sonnet-5-5": { codeMode: false, params: null } },
+        });
+        const entry = fsMock
+          .readConfig()
+          .agents.list.find((a) => a.id === "reception").models["anthropic/claude-sonnet-5-5"];
+        expect(entry).toEqual({
+          agentRuntime: { id: "openclaw" },
+          alias: "sonnet",
+          streaming: false,
+          codeMode: false,
+        });
+      });
+
+      it("keeps an explicitly supplied empty entry (model registration)", async () => {
+        const { fsMock, service } = buildModelsService();
+        await service.updateAgent("reception", { models: { "vllm/*": {} } });
+        const reception = fsMock.readConfig().agents.list.find((a) => a.id === "reception");
+        expect(reception.models).toEqual({ "vllm/*": {} });
+      });
+
+      it("rejects unknown runtimes, keys and entry shapes without writing", async () => {
+        const { fsMock, service } = buildModelsService();
+        const before = JSON.stringify(fsMock.readConfig());
+        const cases = [
+          [{ "anthropic/claude-sonnet-5-5": { agentRuntime: { id: "bogus" } } }, "agentRuntime.id must be one of"],
+          [{ "anthropic/claude-sonnet-5-5": { foo: 1 } }, "unsupported keys: foo"],
+          [{ "anthropic/claude-sonnet-5-5": { agentRuntime: { id: "openclaw", x: 1 } } }, "agentRuntime has unsupported keys"],
+          [{ "no-slash": { agentRuntime: { id: "openclaw" } } }, "is not a provider/model id"],
+          [{ "anthropic/claude-sonnet-5-5": { codeMode: "yes" } }, "codeMode must be true or false"],
+          [["anthropic/claude-sonnet-5-5"], "models must be an object"],
+          [{ "vllm/*": { codeMode: true } }, "codeMode is not allowed on a wildcard model ref"],
+        ];
+        for (const [models, message] of cases) {
+          await expect(service.updateAgent("reception", { models })).rejects.toThrow(message);
+        }
+        expect(JSON.stringify(fsMock.readConfig())).toBe(before);
+      });
+    });
+
+    describe("per-agent skills allowlist", () => {
+      const buildSkillsService = (reception = {}) =>
+        buildService({
+          initialConfig: {
+            agents: {
+              defaults: { skills: ["github", "weather"] },
+              list: [{ id: "main", default: true }, { id: "reception", ...reception }],
+            },
+          },
+        });
+
+      it("sets an exact list, [] for none, and null to inherit the defaults", async () => {
+        const { fsMock, service } = buildSkillsService();
+        const read = () => fsMock.readConfig().agents.list.find((a) => a.id === "reception");
+
+        await service.updateAgent("reception", { skills: [" grant-intake ", "grant-intake", "faq"] });
+        expect(read().skills).toEqual(["grant-intake", "faq"]);
+
+        await service.updateAgent("reception", { skills: [] });
+        expect(read().skills).toEqual([]);
+
+        await service.updateAgent("reception", { skills: null });
+        expect(read()).not.toHaveProperty("skills");
+        expect(fsMock.readConfig().agents.defaults.skills).toEqual(["github", "weather"]);
+      });
+
+      it("rejects malformed skill lists without writing", async () => {
+        const { fsMock, service } = buildSkillsService({ skills: ["faq"] });
+        const before = JSON.stringify(fsMock.readConfig());
+        for (const [skills, message] of [
+          ["faq", "skills must be an array"],
+          [[1], "skills entries must be strings"],
+          [["two words"], "is not a skill name"],
+          [[""], "is not a skill name"],
+        ]) {
+          await expect(service.updateAgent("reception", { skills })).rejects.toThrow(message);
+        }
+        expect(JSON.stringify(fsMock.readConfig())).toBe(before);
+      });
     });
 
     it("rejects invalid thinkingDefault values", async () => {
@@ -713,6 +1043,54 @@ describe("server/agents/service coverage", () => {
     });
   });
 
+  describe("channels domain: update (whatsapp root schema)", () => {
+    const nativeWhatsApp = () => ({
+      dmPolicy: "allowlist",
+      allowFrom: ["+15550100"],
+      selfChatMode: false,
+      groupPolicy: "disabled",
+    });
+
+    it("does not write a root-level name on a flat whatsapp config", () => {
+      const { fsMock, service } = buildService({
+        initialConfig: { channels: { whatsapp: nativeWhatsApp() } },
+      });
+
+      const result = service.updateChannelAccount({
+        provider: "whatsapp",
+        name: "Renamed",
+        agentId: "main",
+      });
+
+      expect(result.account.id).toBe("default");
+      const config = fsMock.readConfig();
+      // The strict WhatsApp plugin schema rejects `name` at the channel root.
+      expect(config.channels.whatsapp).not.toHaveProperty("name");
+      expect(config.channels.whatsapp).toEqual(nativeWhatsApp());
+    });
+
+    it("still writes the name under a named whatsapp account", () => {
+      const { fsMock, service } = buildService({
+        initialConfig: {
+          channels: {
+            whatsapp: { accounts: { work: { allowFrom: ["+15550100"] } } },
+          },
+        },
+      });
+
+      service.updateChannelAccount({
+        provider: "whatsapp",
+        accountId: "work",
+        name: "Work line",
+        agentId: "main",
+      });
+
+      const config = fsMock.readConfig();
+      expect(config.channels.whatsapp).not.toHaveProperty("name");
+      expect(config.channels.whatsapp.accounts.work.name).toBe("Work line");
+    });
+  });
+
   describe("channels domain: delete", () => {
     it("throws for unknown providers and accounts on delete", async () => {
       const empty = buildService();
@@ -949,6 +1327,17 @@ describe("server/agents/service coverage", () => {
   });
 
   describe("channels domain: login", () => {
+    // The login-window knob is read per call from process.env; keep every test
+    // in this block independent of the runner's environment.
+    let previousLoginWindow;
+    beforeEach(() => {
+      previousLoginWindow = process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS;
+      delete process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS;
+    });
+    afterEach(() => {
+      if (previousLoginWindow === undefined) delete process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS;
+      else process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS = previousLoginWindow;
+    });
     it("defaults to the default account for login and login status", async () => {
       const clawCmd = vi.fn(async () => ({
         ok: true,
@@ -983,6 +1372,38 @@ describe("server/agents/service coverage", () => {
         accountId: "default",
         linked: false,
       });
+    });
+
+    it("uses ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS for the QR login window", async () => {
+      const previous = process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS;
+      process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS = "45000";
+      try {
+        const clawCmd = vi.fn(async () => ({ ok: true, stdout: "", stderr: "", code: 0 }));
+        const { service } = buildService({ clawCmd });
+
+        await service.runChannelAccountLogin({ provider: "whatsapp" });
+
+        expect(clawCmd.mock.calls[0][1]).toMatchObject({ timeoutMs: 45000, killScope: "leader" });
+      } finally {
+        if (previous === undefined) delete process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS;
+        else process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS = previous;
+      }
+    });
+
+    it("falls back to the 12 s login window for a junk value", async () => {
+      const previous = process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS;
+      process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS = "not-a-number";
+      try {
+        const clawCmd = vi.fn(async () => ({ ok: true, stdout: "", stderr: "", code: 0 }));
+        const { service } = buildService({ clawCmd });
+
+        await service.runChannelAccountLogin({ provider: "whatsapp" });
+
+        expect(clawCmd.mock.calls[0][1].timeoutMs).toBe(12000);
+      } finally {
+        if (previous === undefined) delete process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS;
+        else process.env.ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS = previous;
+      }
     });
 
     it("rejects login status for non-whatsapp providers", () => {
