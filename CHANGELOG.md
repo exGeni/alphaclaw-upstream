@@ -5,6 +5,16 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.144] - 2026-10-26
+
+A deploy's SIGTERM no longer runs out the ask's window on a gateway that runs a slow-exiting stdio MCP server. OpenClaw 2026.10.7 closes the children it owns as process trees (stdio MCP servers, each under a `service-child-group-anchor.js`) only after the restart drain: stdin EOF, 2 s, SIGTERM, 2 s, SIGKILL. With a server that takes 3 s to exit after its stdin closes, the post-drain close took 7.1 s instead of about 3.5 s on the live tier (3.65 s of it was the child) and 8.9 s in the Render deploy replay. The gateway outlived the ask's window, and v0.10.140's 25 s budget ended it with a signal: `stopped how=sigkill ms=19368` on the live tier, `how=sigterm ms=19095` in the replay (ALPH-46, ALPH-48).
+
+### Fixed
+- **The shutdown ask reserves the owned-child close.** When the gateway's process inventory holds a `service-child-group-anchor.js`, `stopGatewayForShutdown` adds `kGatewayShutdownOwnedChildCloseMs` (6 s) to the ask's overhead, so the overhead is 14 s instead of 8 s. The 6 s covers OpenClaw's two 2 s graces plus the slower close measured beside them on a container (12.4 s from the ask to the exit beyond the drain). The drain shrinks by as much, to about 4 s instead of 10 s with the default budget. The ladder waits as much longer for the close, so the ask's window still ends a second before the SIGKILL step. A gateway with no owned child is unchanged. The ladder now passes its `askGraceMs` resolver `{ inventory }` and takes an `askOverheadMs` the resolver returns; the asking line logs `overheadMs=`.
+
+### Tests
+- `gateway-restart-ladder.test.js`: a gateway with an anchor in its tree is asked with the 6 s shorter `--wait` and `overheadMs=14000`, and a gateway that needs its drain plus 13 s to exit stops gracefully with no signal.
+- `tests/live/shutdown-drain.e2e.test.js` (live tier): a third case adds a stdio MCP server that ignores SIGTERM and exits 3 s after its stdin closes. With an exec turn running, SIGTERM drains, OpenClaw closes the child itself (stdin EOF, then exit), the gateway stops `how=graceful` inside 25 s, and AlphaClaw exits 0. Against main's `gateway.js`, the same case is SIGKILLed at about 19.4 s.
 ## [0.10.143] - 2026-10-26
 
 OpenClaw's own file log now goes to the data volume instead of the container's /tmp. With no `logging.file` in `openclaw.json`, OpenClaw 2026.10.7 writes a daily log to `/tmp/openclaw/openclaw-YYYY-MM-DD.log`. That directory is hard-coded and does not follow TMPDIR. The log rotates by size at 100 MB and keeps five older files, so one day can reach about 600 MB. On hosts like Render, /tmp is a small volume with its own limit, and the instance is replaced when it fills.
