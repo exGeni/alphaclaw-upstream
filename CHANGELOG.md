@@ -5,6 +5,17 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.145] - 2026-10-27
+
+Pin OpenClaw 2026.10.8 (npm `latest` since 2026-10-27 11:24Z). It is a patch release of 162 PRs on top of 2026.10.7: update and Doctor recovery, restart-recovery fences that no longer wedge sessions, retries for transient agent-database lock contention at startup, channel default accounts that keep their secrets, and Codex and Claude CLI turn fixes. It moves neither `openclaw.schemaVersions` (state 20, agent 25) nor `engines.node` (`>=24.22.1 <25 || >=26.12.1`). On real state, 2026.10.7 boots again after 2026.10.8's Doctor has run, so the pin can be rolled back without restoring a backup.
+
+### Changed
+- **OpenClaw pin 2026.10.7 → 2026.10.8.** No `lib/` change was needed. Every OpenClaw contract AlphaClaw reads is unchanged in the 2026.10.8 dist: the `gateway-drain` chunk is byte-identical (drain lines, `backgroundExecSessions`), `STOP_DRAIN_TIMEOUT_MS` is still 20 s, `closeOwnedStdioProcess` keeps its stdin EOF / 2 s / SIGTERM / 2 s / SIGKILL close, the owner heartbeat is still 90 s with the same `wait N s and retry` refusal, the restart-recovery note to the model is unchanged, the `model fallback decision … reason=model_not_found` line is unchanged, `openclaw.control.token.v1` is still the Control UI token key, and every export the Codex migration helpers load by name resolves.
+
+### Tests
+- `tests/live/database-fixture.js`: `kObservedSchemas` gains the 2026.10.8 row (state 20, agent 25), observed on real 2026.10.7 state after 2026.10.8's `doctor --fix --non-interactive`.
+- `tests/live/workspace-alias-move.e2e.test.js`: the doctor-module census strips chunk hashes that contain `-`. 2026.10.8 ships `doctor-repair-mode-CZY1Y--S.mjs`, and the old `[A-Za-z0-9_]{8}` pattern left that hash on the name, so the census failed even though the set of modules was unchanged.
+
 ## [0.10.144] - 2026-10-26
 
 A deploy's SIGTERM no longer runs out the ask's window on a gateway that runs a slow-exiting stdio MCP server. OpenClaw 2026.10.7 closes the children it owns as process trees (stdio MCP servers, each under a `service-child-group-anchor.js`) only after the restart drain: stdin EOF, 2 s, SIGTERM, 2 s, SIGKILL. With a server that takes 3 s to exit after its stdin closes, the post-drain close took 7.1 s instead of about 3.5 s on the live tier (3.65 s of it was the child) and 8.9 s in the Render deploy replay. The gateway outlived the ask's window, and v0.10.140's 25 s budget ended it with a signal: `stopped how=sigkill ms=19368` on the live tier, `how=sigterm ms=19095` in the replay (ALPH-46, ALPH-48).
