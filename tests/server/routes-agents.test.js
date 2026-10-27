@@ -619,6 +619,19 @@ describe("server/routes/agents", () => {
     expect(response.body.ok).toBe(false);
   });
 
+  it("returns a fail-closed 503 on DELETE /api/agents/:id when the topic registry is unreadable (codex)", async () => {
+    const agentsService = createAgentsServiceMock();
+    agentsService.deleteAgent.mockImplementation(() => {
+      const error = new Error("Refusing to touch topic-registry.json: file exists but is not valid JSON");
+      error.code = "TOPIC_REGISTRY_UNREADABLE";
+      throw error;
+    });
+    const app = createApp(agentsService);
+    const response = await request(app).delete("/api/agents/ops");
+    expect(response.status).toBe(503);
+    expect(response.body.ok).toBe(false);
+  });
+
   it("lists bindings on GET /api/agents/:id/bindings", async () => {
     const agentsService = createAgentsServiceMock();
     const app = createApp(agentsService);
