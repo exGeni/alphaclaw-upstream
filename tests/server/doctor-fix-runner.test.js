@@ -84,11 +84,13 @@ describe("server/doctor-fix-runner", () => {
     expect(runStream.runStreamed).toHaveBeenCalledWith({
       command: "openclaw",
       args: ["doctor", "--fix", "--yes"],
-      env: kGatewayEnv,
+      env: { ...kGatewayEnv, OPENCLAW_GATEWAY_STARTUP_TRACE: "1" },
       timeoutMs: 10 * 60 * 1000,
       killGraceMs: 1000,
       onOutput: expect.any(Function),
     });
+    // The trace is the Doctor child's only: the gateway env is not changed.
+    expect(kGatewayEnv).not.toHaveProperty("OPENCLAW_GATEWAY_STARTUP_TRACE");
     // A succeeded run carries no hang diagnostics.
     expect(result).not.toHaveProperty("lastOutputAgeMs");
     expect(result).not.toHaveProperty("lastOutputLine");
@@ -349,6 +351,9 @@ describe("server/doctor-fix-runner heartbeat", () => {
 
     now = 7_000;
     tracker.onOutput("\n", "stderr");
+    expect(tracker.lastLine()).toBe("abcdef");
+    expect(tracker.lastOutputAgeMs()).toBe(0);
+    tracker.onOutput("\n", "stdout");
     expect(tracker.lastLine()).toBe("ghi");
     expect(tracker.lastOutputAgeMs()).toBe(0);
     now = 9_500;
@@ -357,6 +362,18 @@ describe("server/doctor-fix-runner heartbeat", () => {
     // Blank lines never replace the last meaningful one.
     tracker.onOutput("\n   \n", "stdout");
     expect(tracker.lastLine()).toBe("ghi");
+  });
+
+  it("frames stdout and stderr separately, so interleaved chunks never splice two lines", () => {
+    const tracker = createOutputLineTracker({ nowFn: () => 0, startedAt: 0 });
+
+    tracker.onOutput("Doctor could not ", "stdout");
+    tracker.onOutput("[gateway] startup trace: doctor.contributions 12.", "stderr");
+    tracker.onOutput("enter maintenance.\n", "stdout");
+    tracker.onOutput("5ms total=900.1ms\n", "stderr");
+
+    expect(tracker.lastDetailLine()).toBe("Doctor could not enter maintenance.");
+    expect(tracker.lastLine()).toBe("[gateway] startup trace: doctor.contributions 12.5ms total=900.1ms");
   });
 
   it("caps the partial-line buffer at 4 KB by dropping the head", () => {
@@ -438,6 +455,19 @@ describe("server/doctor-fix-runner heartbeat", () => {
       lastOutputAgeMs: 30_000,
       lastOutputLine: "Step 2 (slow)",
     });
+
+    const traced = scriptedRunStream({
+      outputs: [
+        { at: 0, text: "Failing check doctor:state-integrity: agent database is malformed\n" },
+        { at: 1_000, text: "[gateway] startup trace: doctor.contributions 812.4ms total=9000.1ms start=8187.7ms\n" },
+      ],
+      settleAt: 2_000,
+      result: { ok: false, code: 1, tail: "" },
+    });
+    const third = createRunner(openclawDir, { runStream: traced });
+    const pendingTraced = third.run();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect((await pendingTraced).lastOutputLine).toBe("Failing check doctor:state-integrity: agent database is malformed");
 
     const succeeded = scriptedRunStream({
       outputs: [{ at: 0, text: "Doctor complete\n" }],

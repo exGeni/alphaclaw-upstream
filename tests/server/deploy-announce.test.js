@@ -14,12 +14,15 @@ let seq = 0;
 const makeRoot = () => fs.mkdtempSync(path.join(kRoot, `case-${(seq += 1)}-`));
 afterAll(() => fs.rmSync(kRoot, { recursive: true, force: true }));
 
-const makeAnnouncer = ({ rootDir = makeRoot(), clock, processStartedAtMs = 0, sidecarResults = [] } = {}) => {
+const makeAnnouncer = ({ rootDir = makeRoot(), clock, processStartedAtMs = 0, sidecarResults = [], gatewayExpectedAtBoot = true } = {}) => {
   const notices = [];
   const sidecarCalls = [];
   const events = [];
+  const retirements = [];
   let flushed = 0;
   const announcer = createDeployAnnouncer({
+    retireNotices: (matchesId) => retirements.push(matchesId),
+    gatewayExpectedAtBoot,
     rootDir,
     now: () => clock.now,
     processStartedAtMs,
@@ -39,7 +42,7 @@ const makeAnnouncer = ({ rootDir = makeRoot(), clock, processStartedAtMs = 0, si
     insertEvent: (event) => events.push(event.details),
     logger: { log() {}, warn() {}, error() {} },
   });
-  return { announcer, notices, sidecarCalls, events, rootDir, flushes: () => flushed };
+  return { announcer, notices, sidecarCalls, events, retirements, rootDir, flushes: () => flushed };
 };
 
 const T0 = Date.parse("2026-10-25T18:00:00Z");
@@ -127,6 +130,109 @@ describe("deploy announcements", () => {
     expect(result).toEqual({ measured: false, bootSeconds: 95, readyAt: "2026-10-25T18:01:35Z" });
     expect(notices).toEqual([]);
     expect(events[0]).toMatchObject({ phase: "back", measured: false });
+  });
+
+  it("a long data upgrade: one upgrading notice at Doctor start, then back with the whole downtime", async () => {
+    const rootDir = makeRoot();
+    const clock = { now: T0 };
+    const first = makeAnnouncer({ rootDir, clock });
+    await first.announcer.onShutdown({ reason: "SIGTERM" });
+
+    clock.now = T0 + 70 * 1000;
+    const second = makeAnnouncer({ rootDir, clock, processStartedAtMs: T0 + 60 * 1000 });
+    const started = await second.announcer.onDataUpgradeStart({ fromVersion: "2026.10.7", toVersion: "2026.10.8", lastDurationMs: 621_000 });
+    expect(started).toEqual({ notified: true, estimateSeconds: 621 });
+    expect(second.notices[0].message).toBe(
+      "⏳ AlphaClaw is upgrading OpenClaw's data after the update to 2026.10.8; replies resume when it finishes. The last data upgrade took about 10 min 21 s.",
+    );
+    expect(second.notices[0].opts).toMatchObject({ eventType: "deploy", id: `deploy-upgrading-${T0 + 60 * 1000}`, expiresAt: T0 + 70 * 1000 + 621 * 1000 + 5 * 60 * 1000 });
+    expect(await second.announcer.onDataUpgradeStart({ fromVersion: "2026.10.7", toVersion: "2026.10.8" })).toEqual({ notified: false });
+
+    clock.now = T0 + 735 * 1000;
+    const measured = await second.announcer.onGatewayReady({ readyAt: new Date(T0 + 733 * 1000).toISOString() });
+    expect(measured).toMatchObject({ measured: true, seconds: 733 });
+    expect(second.notices[1].message).toBe("✅ AlphaClaw is back: down 12 min 13 s (stopped 2026-10-25T18:00:00Z, gateway ready 2026-10-25T18:12:13Z).");
+    expect(second.notices).toHaveLength(2);
+  });
+
+  it("the upgrading notice has no estimate when no data upgrade was measured, and is never sent while shutting down", async () => {
+    const clock = { now: T0 };
+    const quiet = makeAnnouncer({ clock });
+    await quiet.announcer.onDataUpgradeStart({ toVersion: "2026.10.8", lastDurationMs: null });
+    expect(quiet.notices[0].message).toBe("⏳ AlphaClaw is upgrading OpenClaw's data after the update to 2026.10.8; replies resume when it finishes.");
+    expect(quiet.notices[0].opts.expiresAt).toBe(T0 + 600 * 1000 + 5 * 60 * 1000);
+
+    const stopping = makeAnnouncer({ clock });
+    await stopping.announcer.onShutdown({ reason: "SIGINT" });
+    expect(await stopping.announcer.onDataUpgradeStart({ toVersion: "2026.10.8" })).toEqual({ notified: false });
+    expect(stopping.notices).toEqual([]);
+  });
+
+  it("a box not onboarded at boot measures no outage when its gateway first serves after onboarding", async () => {
+    const clock = { now: T0 };
+    const rootDir = makeRoot();
+    const before = makeAnnouncer({ rootDir, clock, processStartedAtMs: T0 - 60_000 });
+    await before.announcer.onShutdown({ reason: "SIGTERM" });
+    clock.now += 30_000;
+    const unonboarded = makeAnnouncer({ rootDir, clock, processStartedAtMs: clock.now, gatewayExpectedAtBoot: false });
+    clock.now += 3 * 3600_000;
+    await unonboarded.announcer.onShutdown({ reason: "SIGTERM" });
+    expect(unonboarded.announcer.getStatus().lastShutdown.at).toBe(new Date(clock.now).toISOString().replace(/\.\d{3}Z$/, "Z"));
+
+    clock.now += 30_000;
+    const onboardedLater = makeAnnouncer({ rootDir, clock, processStartedAtMs: clock.now, gatewayExpectedAtBoot: false });
+    clock.now += 2 * 3600_000;
+    const result = await onboardedLater.announcer.onGatewayReady({ readyAt: new Date(clock.now).toISOString() });
+
+    expect(result).toMatchObject({ measured: false, reason: "not_onboarded_at_boot" });
+    expect(onboardedLater.notices.filter((notice) => notice.message.includes("back"))).toEqual([]);
+    expect(onboardedLater.announcer.getStatus().lastShutdown).toBeNull();
+  });
+
+  it("serving retires every boot's upgrading notice, and a late Doctor start sends none", async () => {
+    const clock = { now: T0 };
+    const boot = makeAnnouncer({ clock, processStartedAtMs: T0 });
+    await boot.announcer.onDataUpgradeStart({ fromVersion: "2026.10.7", toVersion: "2026.10.8" });
+    const upgradingId = boot.notices[0].opts.id;
+    clock.now += 60_000;
+    await boot.announcer.onGatewayReady({ readyAt: new Date(clock.now).toISOString() });
+
+    expect(boot.retirements).toHaveLength(1);
+    const [matchesId] = boot.retirements;
+    expect(matchesId(upgradingId)).toBe(true);
+    expect(matchesId(`deploy-upgrading-${T0 - 900_000}`)).toBe(true);
+    expect(matchesId(`deploy-back-${T0}`)).toBe(false);
+    expect(matchesId(`deploy-shutdown-${T0}`)).toBe(false);
+    expect(await boot.announcer.onDataUpgradeStart({ fromVersion: "2026.10.7", toVersion: "2026.10.8" })).toEqual({ notified: false });
+  });
+
+  it("a ready answer that lands after SIGTERM sends no back notice and keeps the shutdown record", async () => {
+    const rootDir = makeRoot();
+    const clock = { now: T0 };
+    const first = makeAnnouncer({ rootDir, clock });
+    await first.announcer.onShutdown({ reason: "SIGTERM" });
+    clock.now = T0 + 300 * 1000;
+    const second = makeAnnouncer({ rootDir, clock, processStartedAtMs: T0 + 60 * 1000 });
+    await second.announcer.onShutdown({ reason: "SIGTERM" });
+    expect(await second.announcer.onGatewayReady({ readyAt: new Date(T0 + 301 * 1000).toISOString() })).toBeNull();
+    expect(second.notices.filter((notice) => notice.message.startsWith("✅"))).toEqual([]);
+    expect(second.announcer.getStatus().lastShutdown).toMatchObject({ at: "2026-10-25T18:00:00Z" });
+  });
+
+  it("a boot that never served and is redeployed keeps the outage start, so the next boot measures the whole outage", async () => {
+    const rootDir = makeRoot();
+    const clock = { now: T0 };
+    const first = makeAnnouncer({ rootDir, clock });
+    await first.announcer.onShutdown({ reason: "SIGTERM" });
+
+    clock.now = T0 + 900 * 1000;
+    const neverServed = makeAnnouncer({ rootDir, clock, processStartedAtMs: T0 + 60 * 1000 });
+    await neverServed.announcer.onShutdown({ reason: "SIGTERM" });
+
+    clock.now = T0 + 1200 * 1000;
+    const third = makeAnnouncer({ rootDir, clock, processStartedAtMs: T0 + 960 * 1000 });
+    const measured = await third.announcer.onGatewayReady({ readyAt: new Date(T0 + 1200 * 1000).toISOString() });
+    expect(measured).toMatchObject({ measured: true, seconds: 1200, shutdownAt: "2026-10-25T18:00:00Z" });
   });
 
   it("the announced estimate is quoted after the restart", async () => {
