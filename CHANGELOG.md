@@ -5,6 +5,15 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.154] - 2026-10-29
+
+`npm test` uses every core on machines with 4 cores or fewer, instead of half. That covers the GitHub runner (4 vCPU) and Capy agent machines. The suite spends its time waiting on real git, filesystem and child-process work, so at 2 workers half of a 4-vCPU machine sat idle. On a dedicated 4-vCPU VM a full run went from 159-164 s (5 runs at 2 workers) to 91-95 s (10 runs at 4), with the same tests, statuses and assertion counts, and the same retried and flaky tests at both counts (ALPH-52).
+
+### Changed
+- `vitest.config.js`: `maxWorkers` is the core count on machines with 4 cores or fewer. Bigger machines are unchanged (half the cores, clamped 2..6, where the existing comment measured flakes at 8 and 16).
+- `tests/server/system-resources.test.js`: a new case walks the process tree through a pid with no `VmRSS` line and leaves out one with no `PPid` line. At 2 workers those two branches were reached only incidentally, by a booted server's background resource poll in a slower file, and at 4 workers they were not; the location-by-location coverage diff caught it.
+- `ALPHACLAW_TEST_MAX_WORKERS` overrides the worker count, for example on a machine several agents share (AGENTS.md).
+
 ## [0.10.153] - 2026-10-29
 
 The nightly live tier runs again instead of failing on the runner. Since v0.10.137 (#277), `gateway-stale-heartbeat-relaunch` failed every night on GitHub's Ubuntu 24.04 runner, because AppArmor there blocks unprivileged user namespaces (`unshare: write failed /proc/self/uid_map`) and the test fails rather than skips under `CI`. The tier had also grown to about 44 minutes and timed out at its 45-minute limit on Oct 27 (ALPH-52).
