@@ -5,6 +5,41 @@ All notable changes to AlphaClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow this repository's `package.json` release counter.
 
+## [0.10.156-exgenius.1] - 2026-10-29
+
+exGeni fork line rebuilt on upstream **v0.10.156** (`garrytan/alphaclaw` main
+1f44ff4b). It carries only the WhatsApp channel-sync guard; every other commit
+of the 0.10.145-exgenius.1 line is dropped. The 0.10.145-exgenius.1 and earlier
+fork entries are not re-inserted here; the previous fork line keeps them.
+
+### Carried
+
+| Fork commit (on 0.10.145-exgenius.1) | Here | Subject | Conflict |
+|---|---|---|---|
+| 28b76bc7 | d9b359e3 | sync never auto-removes a WhatsApp channel not derived from `WHATSAPP_OWNER_NUMBER` | none |
+| f8826950 | 8b2f42bf | sync: name the predicate; pin the fresh-onboarding shape | `tests/server/gateway.test.js`: the commit's context held 914a8c51's test, which is not yet applied here; only this commit's own test kept |
+| 914a8c51 (sync part only) | 8cc6ce29 | test: production native WhatsApp shape without `enabled` stays byte-identical | `tests/server/gateway.test.js`: test placed before the fresh-onboarding test as on the fork; its login-window hunk in `agents-service-coverage.test.js` dropped |
+
+### Dropped
+
+| Fork commit (on 0.10.145-exgenius.1) | Subject |
+|---|---|
+| fc261715 | channels.account-update sets an account's DM access (dmPolicy/allowFrom) |
+| c154414f | agents.update sets per-agent model settings (models map) |
+| cc9dcec8 | agents.update sets a per-agent skill allowlist (skills) |
+| 40da5195 | agents.update tools is tier-aware; per-agent allow and fs.workspaceOnly |
+| 3291fe78 | Telegram topic agentId integrity; agents.delete unroutes topics; topic sync reports its changes |
+| f618b48e | topic routes refuse non-slug agent ids and recheck the agent after each Telegram await |
+| 36083b1d | CLI topic --agent refuses non-slug ids; create rechecks the agent |
+| 4b24d2c3 | sync an unrouted topic before the late-agent 409 on create |
+| c2e9ca63 | no root name on flat WhatsApp config; `ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS` |
+| 914a8c51 (login-window part) | test: login-window default isolated from the env knob |
+| 8776e5af | admin CLI frames the request body with Content-Length (DELETE --data) |
+| 523d8ba1 | ci(exgenius): unit suite on PRs into exgenius-*/base |
+| 55322eef | ci(exgenius): skip the main-only version guard on those PRs |
+
+`ALPHACLAW_CHANNEL_LOGIN_WINDOW_MS` is no longer read.
+
 ## [0.10.156] - 2026-10-29
 
 Particle's `particle-1` is available as `particle/particle-1` on every install. OpenClaw ships no Particle provider, so AlphaClaw writes and owns the `models.providers.particle` block while `PARTICLE_API_KEY` is set. Models picked in AlphaClaw are also added to a governing `modelPolicy.allow` list, but only at the next gateway launch: on OpenClaw 2026.10.8 a hot reload of any `modelPolicy` change revokes in-flight session work. A production box showed it: a background command's result never reached the agent (ALPH-53, ALPH-24).
